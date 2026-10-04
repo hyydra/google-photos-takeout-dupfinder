@@ -48,6 +48,7 @@ This repository contains the complete codebase and automation tools for deduplic
 CREATE TABLE f (
   path TEXT PRIMARY KEY,
   size INT,
+  mtime REAL,
   sha TEXT,
   w INT,
   h INT,
@@ -86,15 +87,25 @@ CREATE INDEX idx_gp_meta ON gp(w, h, dt, make, model);
 
 ### Starting the Live Dashboard
 ```powershell
-cd C:\Users\ptral\.gemini\antigravity\scratch\dupfinder\gphotos
+cd L:\google-photos-takeout-dupfinder\gphotos
 python server.py --port 8765
 ```
 Dashboard URL: **`http://localhost:8765/`**
 
+### Scanning a Local Archive
+```powershell
+cd L:\google-photos-takeout-dupfinder
+python dupfinder.py scan "K:\google takeout" --db takeout.sqlite --out takeout_report
+
+# Optional: move non-keeper files of EXACT groups (never deletes). --keep: oldest|newest|shortest|largest
+python dupfinder.py scan "K:\google takeout" --db takeout.sqlite --out takeout_report --quarantine D:\dupes --keep oldest
+```
+Name collisions in the quarantine folder get a numeric suffix (`<sha8>_<n>_<name>`).
+
 ### Running the Google Photos Scanner
 
 ```powershell
-cd C:\Users\ptral\.gemini\antigravity\scratch\dupfinder\gphotos
+cd L:\google-photos-takeout-dupfinder\gphotos
 
 # 1. Batch Test (Scan next 50 items, dry-run without trashing):
 node gphotos.js run --limit 50 --takeout ../takeout.sqlite

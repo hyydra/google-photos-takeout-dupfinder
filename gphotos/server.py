@@ -163,8 +163,10 @@ def kill_port_owner(port):
         out = subprocess.check_output(f'netstat -ano -p tcp | findstr :{port}', shell=True, text=True)
         my_pid = os.getpid()
         for line in out.strip().splitlines():
-            if 'LISTENING' in line:
-                pid = int(line.strip().split()[-1])
+            cols = line.split()
+            # cols: Proto, Local Address, Foreign Address, State, PID
+            if len(cols) >= 5 and cols[3] == 'LISTENING' and cols[1].endswith(f':{port}'):
+                pid = int(cols[-1])
                 if pid != my_pid and pid > 0:
                     print(f"[*] Reclaiming port {port}: terminating old process PID {pid}...")
                     subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)

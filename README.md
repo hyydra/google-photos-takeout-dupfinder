@@ -74,7 +74,7 @@ npx playwright install chrome
 
 ### 3. Scan Local Takeout Directory
 ```bash
-python dupfinder.py "K:\google takeout" --db takeout.sqlite --report takeout_report.csv
+python dupfinder.py scan "K:\google takeout" --db takeout.sqlite --out takeout_report
 ```
 
 ### 4. Start the Live Dashboard

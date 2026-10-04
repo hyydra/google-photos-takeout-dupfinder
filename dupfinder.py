@@ -165,6 +165,10 @@ def quarantine(exact, dest, mode):
             src = Path(r[0])
             tgt = dest / (r[3][:8] + "_" + src.name)
             tgt.parent.mkdir(parents=True, exist_ok=True)
+            n = 1
+            while tgt.exists():  # same sha + same filename in different folders
+                tgt = dest / f"{r[3][:8]}_{n}_{src.name}"
+                n += 1
             shutil.move(str(src), str(tgt))
             moved += 1
     print(f"moved {moved} files to {dest}")
