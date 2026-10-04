@@ -4,6 +4,8 @@ Local image duplicate finder.
 
 Groups:
   EXACT     - identical SHA-256 (byte-identical files)
+  PIXEL     - identical decoded pixels (SHA-256 of the RGB data) but different file bytes
+              (same picture, different metadata / container / re-save without recompression)
   PROBABLE  - same pixel dimensions + same EXIF signature
               (DateTimeOriginal[+SubSec] + Make + Model [+ ImageUniqueID]),
               but different SHA (re-saved / metadata-stripped-then-edited copies, etc.)
@@ -20,7 +22,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageOps
 
 Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".heic", ".heif",
@@ -34,7 +36,40 @@ except Exception:
 TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 DB_SCHEMA = """CREATE TABLE IF NOT EXISTS f(
  path TEXT PRIMARY KEY, size INT, mtime REAL, sha TEXT, w INT, h INT,
- dt TEXT, make TEXT, model TEXT, uid TEXT)"""
+ dt TEXT, make TEXT, model TEXT, uid TEXT, pix TEXT, dh TEXT)"""
+
+
+def migrate(db):
+    """Add the content-hash columns and lookup indexes to a database made by an older version."""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(f)")}
+    for c in ("pix", "dh"):
+        if c not in cols:
+            db.execute(f"ALTER TABLE f ADD COLUMN {c} TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_f_sha ON f(sha)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_f_wh ON f(w, h)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_f_pix ON f(pix)")
+    db.commit()
+
+
+def hamming(a, b):
+    return bin(int(a, 16) ^ int(b, 16)).count("1")
+
+
+def content_hashes(path):
+    """(pixel_sha256, dhash_hex) of the decoded image, orientation-normalised.
+    ('', '') when the file cannot be decoded as an image."""
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            pix = hashlib.sha256(im.tobytes()).hexdigest()
+            px = list(im.convert("L").resize((9, 8), Image.LANCZOS).getdata())
+            bits = 0
+            for row in range(8):
+                for col in range(8):
+                    bits = (bits << 1) | (px[row * 9 + col] > px[row * 9 + col + 1])
+            return pix, f"{bits:016x}"
+    except Exception:
+        return "", ""
 
 
 def sha256(path, bufsize=1 << 20):
@@ -68,7 +103,8 @@ def read_meta(path):
 def process(path):
     st = os.stat(path)
     w, h, dt, make, model, uid = read_meta(path)
-    return (str(path), st.st_size, st.st_mtime, sha256(path), w, h, dt, make, model, uid)
+    return (str(path), st.st_size, st.st_mtime, sha256(path), w, h, dt, make, model, uid,
+            *content_hashes(path))
 
 
 def walk(roots):
@@ -82,12 +118,13 @@ def walk(roots):
 def scan(args):
     db = sqlite3.connect(args.db)
     db.execute(DB_SCHEMA)
+    migrate(db)
     cached = {r[0]: r for r in db.execute("SELECT * FROM f")}
     todo, rows = [], []
     for p in walk(args.paths):
         st = os.stat(p)
         c = cached.get(str(p))
-        if c and c[1] == st.st_size and c[2] == st.st_mtime:
+        if c and c[1] == st.st_size and c[2] == st.st_mtime and c[10] is not None:  # NULL pix = not content-hashed yet
             rows.append(c)
         else:
             todo.append(p)
@@ -96,7 +133,7 @@ def scan(args):
     with ThreadPoolExecutor(args.workers) as ex:
         for i, r in enumerate(ex.map(lambda p: safe(process, p), todo), 1):
             if r:
-                db.execute("INSERT OR REPLACE INTO f VALUES(?,?,?,?,?,?,?,?,?,?)", r)
+                db.execute("INSERT OR REPLACE INTO f VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", r)
                 rows.append(r)
             if i % 200 == 0:
                 db.commit()
@@ -121,7 +158,7 @@ def group(rows):
 
     sig = defaultdict(list)
     for r in rows:
-        path, size, mt, sha, w, h, dt, make, model, uid = r
+        path, size, mt, sha, w, h, dt, make, model, uid = r[:10]
         if not (w and h and (dt or uid)):  # need real EXIF evidence
             continue
         sig[(w, h, dt, make, model, uid)].append(r)
@@ -129,7 +166,13 @@ def group(rows):
     for g in sig.values():
         if len({r[3] for r in g}) > 1:  # >1 distinct sha => not already exact
             probable.append(g)
-    return exact, probable
+
+    pix = defaultdict(list)
+    for r in rows:
+        if r[10]:
+            pix[r[10]].append(r)
+    pixel = [g for g in pix.values() if len({r[3] for r in g}) > 1]
+    return exact, probable, pixel
 
 
 def pick_keeper(g, mode):
@@ -138,20 +181,20 @@ def pick_keeper(g, mode):
     return min(g, key=key)
 
 
-def write_reports(exact, probable, out):
+def write_reports(exact, probable, pixel, out):
     with open(out + ".csv", "w", newline="", encoding="utf-8") as fh:
         wr = csv.writer(fh)
         wr.writerow(["type", "group", "path", "size", "mtime", "sha256", "w", "h",
-                     "exif_datetime", "make", "model", "unique_id"])
-        for kind, groups in (("EXACT", exact), ("PROBABLE", probable)):
+                     "exif_datetime", "make", "model", "unique_id", "pixel_sha256", "dhash"])
+        for kind, groups in (("EXACT", exact), ("PIXEL", pixel), ("PROBABLE", probable)):
             for i, g in enumerate(groups, 1):
                 for r in g:
                     wr.writerow([kind, f"{kind[0]}{i}", *r[0:2], time.strftime("%F %T", time.localtime(r[2])), *r[3:]])
     with open(out + ".json", "w", encoding="utf-8") as fh:
-        json.dump({"exact": exact, "probable": probable}, fh, ensure_ascii=False, indent=1)
+        json.dump({"exact": exact, "pixel": pixel, "probable": probable}, fh, ensure_ascii=False, indent=1)
     wasted = sum(sum(r[1] for r in g) - max(r[1] for r in g) for g in exact)
     print(f"EXACT groups: {len(exact)} (reclaimable {wasted/1e6:.1f} MB)  "
-          f"PROBABLE groups: {len(probable)}\nreports: {out}.csv / {out}.json")
+          f"PIXEL groups: {len(pixel)}  PROBABLE groups: {len(probable)}\nreports: {out}.csv / {out}.json")
 
 
 def quarantine(exact, dest, mode):
@@ -186,8 +229,8 @@ def main():
     s.add_argument("--keep", default="oldest", choices=["oldest", "newest", "shortest", "largest"])
     a = ap.parse_args()
     rows = scan(a)
-    exact, probable = group(rows)
-    write_reports(exact, probable, a.out)
+    exact, probable, pixel = group(rows)
+    write_reports(exact, probable, pixel, a.out)
     if a.quarantine:
         quarantine(exact, a.quarantine, a.keep)
 

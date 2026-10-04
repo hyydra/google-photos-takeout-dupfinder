@@ -1,13 +1,16 @@
 // Google Photos duplicate audit and trash pipeline (Puppeteer).
 //
 // Usage:
-//   node gphotos.js run [--limit 500] [--takeout ../takeout.sqlite] [--delete-gp-dups] [--delete-local-dups] [--keep] [--headless]
+//   node gphotos.js run [--limit 500] [--takeout ../takeout.sqlite] [--keep] [--headless]
+//   node gphotos.js trash [--headless]               # shows what it would do, trashes nothing
+//   node gphotos.js trash --confirm <count> [--headless]
 //   node gphotos.js report
 //
-// Walks the library newest-first with the photo viewer, downloads each original, and hands it to
-// gp_ingest.py (SHA-256 + EXIF + cross-match). Dry-run by default: nothing is trashed unless
-// --delete-gp-dups / --delete-local-dups is given, and only a byte-identical match (SHA-256 + size)
-// may be trashed. Videos are skipped.
+// `run` walks the library newest-first with the photo viewer, downloads each original, and hands it to
+// gp_ingest.py (SHA-256, pixel hash, perceptual hash, EXIF cross-match). It NEVER trashes anything: it
+// only logs. Duplicates are reviewed and marked in the dashboard (saved to marked.txt), and only
+// `trash --confirm <count>` moves exactly those marked photos to the Google Photos trash (recoverable
+// for 60 days). Videos are skipped.
 //
 // Downloads are handled by Chrome itself (Browser.setDownloadBehavior) and picked up from a folder:
 // Playwright's download interception closes the whole browser on Google Photos' download tab.
@@ -221,13 +224,15 @@ function rebuildReport() {
 
 async function run() {
   const takeout = flagVal('--takeout');
-  const delGp = process.argv.includes('--delete-gp-dups');
-  const delLocal = process.argv.includes('--delete-local-dups');
+  if (process.argv.includes('--delete-gp-dups') || process.argv.includes('--delete-local-dups')) {
+    console.error('Automatic trashing was removed. Review and mark duplicates in the dashboard, then run: node gphotos.js trash --confirm <count>');
+    process.exit(2);
+  }
   const keep = process.argv.includes('--keep');
   const limit = Number(flagVal('--limit')) || Infinity;
   const done = new Set(lines(DONE));
 
-  log(`start | limit ${limit === Infinity ? 'none' : limit} | takeout ${takeout || 'none'} | trash gp dups ${delGp} | trash local dups ${delLocal}`);
+  log(`start (log only, never trashes) | limit ${limit === Infinity ? 'none' : limit} | takeout ${takeout || 'none'}`);
 
   const browser = await launch();
   const page = (await activePage(browser)) || (await browser.newPage());
@@ -239,12 +244,11 @@ async function run() {
     const id = idFromUrl(page.url());
     if (!id) { await sleep(500); failedNext++; continue; }
 
-    let trashed = false;
     if (done.has(id)) {
       if (++fastForwarded % 50 === 0) log(`fast-forwarded ${fastForwarded} already-done photos`);
     } else {
       try {
-        trashed = await withTimeout((async () => {
+        await withTimeout((async () => {
           if ((await waitForViewer(page)) === 'video') throw new VideoSkip();
           const file = await downloadOriginal(page, id);
           let target = file;
@@ -257,24 +261,18 @@ async function run() {
           if (keep && fs.existsSync(file)) fs.rmSync(file, { force: true });
           if (!v.w || !v.h) throw new VideoSkip(); // not a readable image
 
+          // WOULD_TRASH = byte-identical to another photo; PROBABLE_REVIEW = same pixels / near-identical /
+          // same EXIF but different bytes. Both are only logged, for review in the dashboard.
           let action = 'KEEP';
-          if (v.gp_dup_of) action = delGp ? 'TRASH' : 'WOULD_TRASH';
-          else if (v.local_dup) action = delLocal ? 'TRASH' : 'WOULD_TRASH';
+          if (v.gp_dup_of || v.local_dup) action = 'WOULD_TRASH';
           else if (v.probable) action = 'PROBABLE_REVIEW';
 
-          // Only a byte-identical match (SHA-256 + size) may be trashed; anything less is log-only.
-          if (action === 'TRASH' && !(v.sha && v.size > 0)) action = 'WOULD_TRASH';
-
-          let didTrash = false;
-          if (action === 'TRASH') didTrash = await trashCurrent(page);
-
           fs.appendFileSync(LOG, [id, action, v.sha, v.size, `${v.w}x${v.h}`, v.dt, v.make, v.model,
-            v.gp_dup_of || '', v.local_dup || '', v.probable || ''].join('\t') + '\n');
+            v.gp_dup_of || '', v.local_dup || '', v.probable || '', v.reason || ''].join('\t') + '\n');
           fs.appendFileSync(DONE, id + '\n');
           done.add(id);
           count++;
-          log(`#${count} ${id.slice(0, 12)}… ${action} ${v.w}x${v.h}`);
-          return didTrash;
+          log(`#${count} ${id.slice(0, 12)}… ${action}${v.reason ? ' (' + v.reason + ')' : ''} ${v.w}x${v.h}`);
         })(), PHOTO_DEADLINE_MS, `photo ${id}`);
       } catch (e) {
         fs.appendFileSync(DONE, id + '\n');
@@ -291,8 +289,7 @@ async function run() {
       if (count > 0 && count % REPORT_EVERY === 0) await rebuildReport();
     }
 
-    if (trashed) await sleep(1000); // Google Photos moves to the next photo itself after a trash
-    const moved = trashed && idFromUrl(page.url()) !== id ? true : await goNext(page, id);
+    const moved = await goNext(page, id);
     failedNext = moved ? 0 : failedNext + 1;
     if (!moved) log(`could not advance from ${id.slice(0, 12)}… (${failedNext}/${END_AFTER_FAILED_NEXT})`);
   }
@@ -303,13 +300,59 @@ async function run() {
   await browser.close();
 }
 
+// Move exactly the photos marked in the dashboard (marked.txt) to the Google Photos trash.
+// Refuses unless --confirm <count> matches the number of eligible photos.
+async function trashMarked() {
+  const marked = lines(path.join(ROOT, 'marked.txt'));
+  const status = new Map(lines(LOG).map((l) => l.split('\t')).map((c) => [c[0], c[1]]));
+  const eligible = marked.filter((id) => ['WOULD_TRASH', 'PROBABLE_REVIEW'].includes(status.get(id)));
+  console.log(`${marked.length} marked in the dashboard, ${eligible.length} eligible `
+    + `(${marked.length - eligible.length} not in the scan log as a duplicate/suspect, or already trashed)`);
+  if (eligible.length === 0) return;
+  if (flagVal('--confirm') !== String(eligible.length)) {
+    console.log(`\nNothing was trashed. To move these ${eligible.length} photos to the Google Photos trash `
+      + `(recoverable for 60 days) run:\n  node gphotos.js trash --confirm ${eligible.length}`);
+    return;
+  }
+  const browser = await launch();
+  const page = (await activePage(browser)) || (await browser.newPage());
+  let ok = 0;
+  for (const id of eligible) {
+    try {
+      await page.goto(`https://photos.google.com/photo/${id}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await waitForViewer(page);
+      if (idFromUrl(page.url()) !== id) throw new Error('viewer opened a different photo');
+      await sleep(1000);
+      if (!(await trashCurrent(page))) throw new Error('trash confirmation not found');
+      fs.appendFileSync(path.join(ROOT, 'trashed.txt'), id + '\n');
+      ok++;
+      log(`trashed ${ok}/${eligible.length} ${id.slice(0, 12)}…`);
+    } catch (e) {
+      fs.appendFileSync(FAILED, `${id}\ttrash: ${e.message}\n`);
+      log(`NOT trashed ${id.slice(0, 12)}…: ${e.message}`);
+      await page.screenshot({ path: STALL_SHOT }).catch(() => {});
+    }
+  }
+  // Reflect the result in the log and drop trashed ids from the marks.
+  const trashedIds = new Set(lines(path.join(ROOT, 'trashed.txt')));
+  fs.writeFileSync(LOG, lines(LOG).map((l) => {
+    const c = l.split('\t');
+    if (trashedIds.has(c[0])) c[1] = 'TRASH';
+    return c.join('\t');
+  }).join('\n') + '\n');
+  fs.writeFileSync(path.join(ROOT, 'marked.txt'), marked.filter((id) => !trashedIds.has(id)).join('\n') + '\n');
+  log(`done: ${ok} of ${eligible.length} moved to the Google Photos trash`);
+  browser.removeAllListeners('disconnected');
+  await browser.close();
+}
+
 async function report() {
   await rebuildReport();
   log(`report ready: ${path.join(ROOT, 'report.html')}`);
 }
 
 const cmd = process.argv[2] || 'run';
-(cmd === 'report' ? report() : run()).catch((e) => {
+(cmd === 'report' ? report() : cmd === 'trash' ? trashMarked() : run()).catch((e) => {
   console.error('\n[FATAL]', e.message);
   process.exit(1);
 });

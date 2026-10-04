@@ -11,6 +11,13 @@ from collections import defaultdict
 from pathlib import Path
 from PIL import Image
 
+REASON_TEXT = {
+    'pixels': 'identical pixels, different file',
+    'similar': 'near-identical picture (perceptual hash)',
+    'exif': 'same size + EXIF, different file',
+}
+
+
 def format_size(num):
     for unit in ['B', 'KB', 'MB', 'GB']:
         if abs(num) < 1024.0:
@@ -34,7 +41,7 @@ def generate_report(log_path, out_path, thumb_dir):
             parts = line.rstrip('\r\n').split('\t')
             if not parts or not parts[0]:
                 continue
-            while len(parts) < 11:
+            while len(parts) < 12:
                 parts.append('')
             pid, action, sha, sz_str, dims, dt, make, model, gp_dup, local_dup, prob = parts[:11]
             try:
@@ -68,6 +75,7 @@ def generate_report(log_path, out_path, thumb_dir):
                 "gp_dup_of": gp_dup,
                 "local_dup": local_dup,
                 "probable": prob,
+                "reason": parts[11],
                 "has_thumb": (thumb_dir / f"{pid}.jpg").exists(),
                 "has_local_thumb": (thumb_dir / f"local_{sha[:12]}.jpg").exists() if local_dup else False,
             })
@@ -148,6 +156,7 @@ def generate_report(log_path, out_path, thumb_dir):
         group_num += 1
         dup_groups.append({
             "num": group_num, "kind": "suspicious",
+            "reason": next((x['reason'] for x in dups if x.get('reason')), 'exif'),
             "sha": keepers[0]['sha'] if keepers else gp[0]['sha'],
             "dims": gp[0]['dims'], "camera": gp[0]['camera'], "dt": gp[0]['dt'],
             "keepers": keepers, "local_keeper": local, "duplicates": dups,
@@ -568,7 +577,7 @@ def generate_report(log_path, out_path, thumb_dir):
       <div class="dup-group-header">
         <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
           <span class="group-badge-title">{'SUSPICIOUS' if g['kind'] == 'suspicious' else 'DUPLICATE'} GROUP #{g['num']}</span>
-          <span class="sha-tag" title="Click to copy full SHA" onclick="navigator.clipboard.writeText('{g['sha']}')">{'same size + EXIF, different file' if g['kind'] == 'suspicious' else 'SHA-256: ' + g['sha'][:16] + '...'}</span>
+          <span class="sha-tag" title="Click to copy full SHA" onclick="navigator.clipboard.writeText('{g['sha']}')">{REASON_TEXT.get(g.get('reason'), 'same size + EXIF, different file') if g['kind'] == 'suspicious' else 'SHA-256: ' + g['sha'][:16] + '...'}</span>
         </div>
         <div class="group-meta">
           <span>{html.escape(g['dims'])}</span> &bull; <span>{html.escape(g['camera'])}</span> &bull; <span>{html.escape(g['dt'])}</span>
