@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Google Photos Duplicate Audit Report</title>
+<style>
+  :root {
+    --bg-main: #0c0d10;
+    --bg-surface: #15171e;
+    --bg-card: #1c1e27;
+    --border: #2b2e3b;
+    --text-primary: #f3f4f6;
+    --text-secondary: #9ca3af;
+    --text-muted: #6b7280;
+    --accent-keep: #10b981;
+    --accent-trash: #f43f5e;
+    --accent-would: #f59e0b;
+    --accent-prob: #a855f7;
+    --accent-blue: #3b82f6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+    padding: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container { max-width: 1720px; margin: 0 auto; }
+
+  /* Header */
+  header {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 26px 32px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  }
+  .header-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; margin-bottom: 20px; }
+  h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; display: flex; align-items: center; gap: 10px; }
+  .tag-badge { background: #222634; color: #94a3b8; font-size: 13px; font-weight: 500; padding: 3px 10px; border-radius: 6px; }
+
+  /* Metric cards */
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+  .metric-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+  }
+  .metric-val { font-size: 26px; font-weight: 700; line-height: 1.2; margin-top: 4px; }
+  .metric-lbl { font-size: 13px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+
+  /* Controls */
+  .controls-bar {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 24px;
+    margin-bottom: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  .filter-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tab-btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tab-btn:hover { background: #262936; color: var(--text-primary); }
+  .tab-btn.active { background: #2563eb; border-color: #3b82f6; color: #fff; font-weight: 600; }
+  .tab-count {
+    background: rgba(255,255,255,0.15);
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 12px;
+  }
+
+  .search-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    width: 280px;
+    outline: none;
+  }
+  .search-box:focus { border-color: var(--accent-blue); }
+
+  /* ========================================================
+     DUPLICATE GROUP STYLING (BLUE BORDER BOX)
+     ======================================================== */
+  .dup-group {
+    background: var(--bg-surface);
+    border: 2px solid #3b82f6; /* Blue border as requested */
+    border-radius: 14px;
+    padding: 20px 24px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 24px rgba(59, 130, 246, 0.12);
+  }
+  .dup-group-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+    margin-bottom: 18px;
+  }
+  .group-badge-title {
+    background: #1d4ed8;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 4px 12px;
+    border-radius: 6px;
+    letter-spacing: 0.5px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .group-meta {
+    font-size: 13px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .reclaim-pill {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  /* Grid of cards inside group */
+  .group-cards-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+    gap: 18px;
+  }
+
+  /* Photo Card Base */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+
+  /* Keeper Card: GREEN */
+  .card.card-keeper {
+    border: 2px solid #10b981; /* Green border for the single keeper */
+    box-shadow: 0 0 16px rgba(16, 185, 129, 0.12);
+  }
+  /* Duplicate Card: RED */
+  .card.card-duplicate {
+    border: 2px solid #f43f5e; /* Red border for duplicate */
+    box-shadow: 0 0 16px rgba(244, 63, 94, 0.12);
+  }
+
+  .thumb-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .thumb-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: transform 0.2s ease;
+  }
+  .thumb-wrap:hover img { transform: scale(1.03); }
+  .card.card-duplicate .thumb-wrap img {
+    filter: brightness(0.82) contrast(0.95);
+  }
+
+  .thumb-placeholder {
+    color: var(--text-muted);
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Thin Red X overlay for duplicates */
+  .cross-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 5;
+  }
+  .cross-overlay svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.9));
+  }
+
+  .badge {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+    z-index: 6;
+  }
+  .badge-keeper { background: var(--accent-keep); color: #fff; }
+  .badge-duplicate { background: var(--accent-trash); color: #fff; }
+  .badge-would { background: var(--accent-would); color: #000; }
+
+  .card-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .meta-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--text-secondary); }
+  .meta-pill {
+    background: #15171f;
+    border: 1px solid var(--border);
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+  }
+  .camera-row { font-size: 13px; color: var(--text-primary); font-weight: 500; display: flex; align-items: center; gap: 6px; }
+  .date-row { font-size: 12px; color: var(--text-muted); }
+
+  .card-footer {
+    margin-top: auto;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .btn-link {
+    color: var(--accent-blue);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .btn-link:hover { text-decoration: underline; }
+  .sha-tag {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .sha-tag:hover { color: var(--text-primary); }
+
+  /* Standard Grid */
+  .photo-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap: 20px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="header-top">
+      <div>
+        <h1>Google Photos Duplicate Audit Report <span class="tag-badge">Clustered Duplicate Groups</span></h1>
+        <p style="color: var(--text-secondary); font-size: 14px; margin-top: 4px;">
+          Synchronized inspection with blue-bordered duplicate groups, green keepers, and red crossed duplicates.
+        </p>
+      </div>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-lbl">Total Scanned</div>
+        <div class="metric-val">28</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-lbl">Duplicate Groups</div>
+        <div class="metric-val" style="color: #60a5fa;">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-lbl">Originals Kept</div>
+        <div class="metric-val" style="color: var(--accent-keep);">28</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-lbl">Duplicates Trashed</div>
+        <div class="metric-val" style="color: var(--accent-trash);">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-lbl">Duplicate Storage</div>
+        <div class="metric-val" style="color: #60a5fa;">0.0 B</div>
+      </div>
+    </div>
+  </header>
+
+  <div class="controls-bar">
+    <div class="filter-tabs">
+      <button class="tab-btn " onclick="switchView('groups', this)">Duplicate Groups <span class="tab-count">0</span></button>
+      <button class="tab-btn active" onclick="switchView('all', this)">All Items Grid <span class="tab-count">28</span></button>
+      <button class="tab-btn" onclick="filterStandard('trash', this)">Deleted <span class="tab-count">0</span></button>
+      <button class="tab-btn" onclick="filterStandard('would', this)">Would Trash <span class="tab-count">0</span></button>
+      <button class="tab-btn" onclick="filterStandard('keep', this)">Kept Originals <span class="tab-count">28</span></button>
+    </div>
+    <div style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
+      <div id="liveStatusBadge" style="display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--accent-keep); background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); padding: 4px 10px; border-radius: 20px;">
+        <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--accent-keep); box-shadow: 0 0 6px var(--accent-keep);"></span>
+        <span style="font-weight:700;">LIVE</span>
+        <span id="refreshCountdown" style="color:var(--text-muted); font-size:12px;">3s</span>
+      </div>
+      <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer;">
+        <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()"> Auto-refresh
+      </label>
+      <input type="text" id="searchBox" class="search-box" placeholder="Filter by camera, date, SHA..." oninput="handleSearch()">
+    </div>
+  </div>
+
+  <!-- VIEW 1: DUPLICATE GROUPS (DEFAULT VIEW) -->
+  <div id="duplicateGroupsView" style="display: none;">
+    <div style="text-align: center; padding: 60px 20px; background: var(--bg-surface); border: 1px dashed var(--border); border-radius: 14px; color: var(--text-muted);">
+      <div style="font-size: 40px; margin-bottom: 12px;">&#10004;</div>
+      <h3 style="color: var(--text-primary); font-size: 18px;">No duplicate groups identified yet in this batch.</h3>
+      <p style="margin-top: 8px; font-size: 14px;">All photos inspected so far have distinct SHA-256 hashes. As the scan advances into duplicates, groups with blue borders will appear here automatically.</p>
+    </div>
+  </div>
+
+  <!-- VIEW 2: FLAT ALL ITEMS GRID -->
+  <div id="standardGrid" class="photo-grid" style="display: {all_disp};">
+    <div class="card card-keeper" data-category="keep" data-search="af1qipn5tcjuw-77ntf0mppq39squssvrrdbsrrme7dr samsung sm-s901b 2026:10:02 18:39:58.054 8784039dc31653de6cdbb2027624c3860f1edb73ea0fa356c0cc909df647ebb7">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipN5TcJuw-77nTf0MPpq39squsSVRrDBSrrmE7Dr.jpg" alt="AF1QipN5TcJuw-77nTf0MPpq39squsSVRrDBSrrmE7Dr" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">5.6 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:02 18:39:58.054</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipN5TcJuw-77nTf0MPpq39squsSVRrDBSrrmE7Dr" target="_blank">&#8599; View</a>
+          <span class="sha-tag">8784039d...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipntjdgqlnin4wr8wiz-brgytkjbtyzg1wc3tnuh samsung sm-s901b 2026:10:02 18:39:49.676 1fe76d1e9c8dae6386439adcf64e3db994cc9dff186f3782fbcd36f5fba2cac7">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipNtJDgQLnIN4WR8WiZ-brgytkJBtyzg1wc3TnUh.jpg" alt="AF1QipNtJDgQLnIN4WR8WiZ-brgytkJBtyzg1wc3TnUh" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">6.5 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:02 18:39:49.676</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipNtJDgQLnIN4WR8WiZ-brgytkJBtyzg1wc3TnUh" target="_blank">&#8599; View</a>
+          <span class="sha-tag">1fe76d1e...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippunpsmxw8ll7prifg8032zplbyv0s0-qdkku5r samsung sm-s901b 2026:10:02 18:00:11.0080 0741fbeb3d327751ad3c16dfe79c1543269af296e132fd8945bf54105ae1157a">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPunPsMxw8Ll7prIFG8032zpLbyv0S0-QdkKu5R.jpg" alt="AF1QipPunPsMxw8Ll7prIFG8032zpLbyv0S0-QdkKu5R" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">2.9 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:02 18:00:11.0080</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPunPsMxw8Ll7prIFG8032zpLbyv0S0-QdkKu5R" target="_blank">&#8599; View</a>
+          <span class="sha-tag">0741fbeb...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipnqkfcizfvkc3flagoyuav3pfq8u6vmgu80tekq  2026:10:02 17:09:59.034 c64cbd8cd021aea8cd7ec6a8bc037fe499bdf413c7500e5cdfb09c65ef572788">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipNQkfcIzFvkC3FLAGoYuav3pFQ8u6VMgu80tekq.jpg" alt="AF1QipNQkfcIzFvkC3FLAGoYuav3pFQ8u6VMgu80tekq" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1080x1466</span>
+          <span class="meta-pill">359.9 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">2026:10:02 17:09:59.034</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipNQkfcIzFvkC3FLAGoYuav3pFQ8u6VMgu80tekq" target="_blank">&#8599; View</a>
+          <span class="sha-tag">c64cbd8c...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipmajqfgghzq4gntaxpgw5hbsbwkkvdei3sa8x8m  2026:10:02 17:09:37.908 3005232fed2fab9d7267efe8d0100b547cdbdd580fe8af111072416e4c193523">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipMajqfGgHzQ4gNtAXPGW5HBsBWKkvDeI3sa8x8M.jpg" alt="AF1QipMajqfGgHzQ4gNtAXPGW5HBsBWKkvDeI3sa8x8M" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1080x2340</span>
+          <span class="meta-pill">446.1 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">2026:10:02 17:09:37.908</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipMajqfGgHzQ4gNtAXPGW5HBsBWKkvDeI3sa8x8M" target="_blank">&#8599; View</a>
+          <span class="sha-tag">3005232f...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipmhyv3ryk-bggatn5eyf3gg-xzhrntxdslkrsy0  2026:10:02 17:09:28.129 ad590dad5e36a0dab2acfe29affd81dc5cb550c8c0a21e5d622cf37be78fa8f9">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipMhYv3RYK-bGgATN5eYF3GG-xZhRNtxDslkRSy0.jpg" alt="AF1QipMhYv3RYK-bGgATN5eYF3GG-xZhRNtxDslkRSy0" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1080x2340</span>
+          <span class="meta-pill">446.2 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">2026:10:02 17:09:28.129</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipMhYv3RYK-bGgATN5eYF3GG-xZhRNtxDslkRSy0" target="_blank">&#8599; View</a>
+          <span class="sha-tag">ad590dad...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipnk4zucxmp1zmpmglkd_oebjlpwsmnglx123adw  2026:10:02 16:53:51.469 3f2c3a03703b16b03679383e7a920ef4ea3d74549d118acf7362ca40f62ecb97">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipNK4ZucXmP1zMpMGlKD_oEBJLpwSMNgLx123ADW.jpg" alt="AF1QipNK4ZucXmP1zMpMGlKD_oEBJLpwSMNgLx123ADW" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1080x1749</span>
+          <span class="meta-pill">663.7 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">2026:10:02 16:53:51.469</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipNK4ZucXmP1zMpMGlKD_oEBJLpwSMNgLx123ADW" target="_blank">&#8599; View</a>
+          <span class="sha-tag">3f2c3a03...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipopr7e94aannygfrj3g42chnlibjoqqumcemqi7   ddda597fd0ef4ee067ffa30bdbad210134aed21bcd28dd7bae0128d4e67ab328">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipOPr7e94AaNnYGFrJ3g42CHnlIbJoqqUMCEmQi7.jpg" alt="AF1QipOPr7e94AaNnYGFrJ3g42CHnlIbJoqqUMCEmQi7" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1153x2048</span>
+          <span class="meta-pill">228.8 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">No EXIF Date</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipOPr7e94AaNnYGFrJ3g42CHnlIbJoqqUMCEmQi7" target="_blank">&#8599; View</a>
+          <span class="sha-tag">ddda597f...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippcqqvnwtfjcsr66p-l4ec-la91eljiyoee8fmf   42dabc179c09092af563c43d1da75c1467fa89084af5d087a9d36aab5239e06a">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPcqqVNWtfJcSR66p-L4ec-lA91EljiYoee8fmF.jpg" alt="AF1QipPcqqVNWtfJcSR66p-L4ec-lA91EljiYoee8fmF" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1498x2048</span>
+          <span class="meta-pill">149.1 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">No EXIF Date</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPcqqVNWtfJcSR66p-L4ec-lA91EljiYoee8fmF" target="_blank">&#8599; View</a>
+          <span class="sha-tag">42dabc17...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipoygkiqciww8nzgsqtmdy4b8sah3-rmpzpgt402  2026:10:02 16:25:40.272 9961e8ecf2800f6eba616de59ae8fe4994a47600c3a294ac85382f12a6bca89b">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipOyGkiQCIWw8NZGsqtMDY4B8sAh3-RMPZPgT402.jpg" alt="AF1QipOyGkiQCIWw8NZGsqtMDY4B8sAh3-RMPZPgT402" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1035x726</span>
+          <span class="meta-pill">459.8 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">2026:10:02 16:25:40.272</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipOyGkiQCIWw8NZGsqtMDY4B8sAh3-RMPZPgT402" target="_blank">&#8599; View</a>
+          <span class="sha-tag">9961e8ec...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipmwup642r4a6yzxnjpnpaxgmkqic-djtk7cxn6s  2026:10:02 16:25:06.502 4132086c3c82dd3bd116a67ef0e5fef0e5f9dd39695ee4b4a39e905070801638">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipMWuP642r4a6YZxnjPnPAxGMkqIC-dJtK7CxN6S.jpg" alt="AF1QipMWuP642r4a6YZxnjPnPAxGMkqIC-dJtK7CxN6S" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1080x2340</span>
+          <span class="meta-pill">1.0 MB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">2026:10:02 16:25:06.502</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipMWuP642r4a6YZxnjPnPAxGMkqIC-dJtK7CxN6S" target="_blank">&#8599; View</a>
+          <span class="sha-tag">4132086c...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qiposwvwujazn1ud2rc8qzxds3bfixan4pixvsmug samsung sm-s901b 2026:10:02 10:27:05.211 5626c5ecbcd6758668c8fe149e3a3a88b1828d641aead33c01d271b0d19be6cc">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipOSWVWuJAZn1uD2RC8qZxdS3bFiXAN4pIXvSmuG.jpg" alt="AF1QipOSWVWuJAZn1uD2RC8qZxdS3bFiXAN4pIXvSmuG" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">4.1 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:02 10:27:05.211</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipOSWVWuJAZn1uD2RC8qZxdS3bFiXAN4pIXvSmuG" target="_blank">&#8599; View</a>
+          <span class="sha-tag">5626c5ec...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipmi0augbsv2pkovvabpk8cbwf5ujy-rve7p8rba   133bf9f1b12c4c7191503d9df67d834f3f280724b887eb7751bed6d5939e9e7c">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipMi0augbsv2Pkovvabpk8cbwF5UJY-Rve7P8RBa.jpg" alt="AF1QipMi0augbsv2Pkovvabpk8cbwF5UJY-Rve7P8RBa" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">480x480</span>
+          <span class="meta-pill">119.1 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">No EXIF Date</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipMi0augbsv2Pkovvabpk8cbwF5UJY-Rve7P8RBa" target="_blank">&#8599; View</a>
+          <span class="sha-tag">133bf9f1...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipphbr0nglqlul1go_p4ewqrckafakx83yf80mog samsung sm-s901b 2026:10:01 18:25:06.279 445bd410ffdb4ba5bd76ea2be6d3b071971e4dcbc2a8dd9bf837f57ea4c6d264">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPHBr0nGlQluL1Go_P4EwQRcKaFaKx83YF80MOg.jpg" alt="AF1QipPHBr0nGlQluL1Go_P4EwQRcKaFaKx83YF80MOg" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">3.9 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:25:06.279</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPHBr0nGlQluL1Go_P4EwQRcKaFaKx83YF80MOg" target="_blank">&#8599; View</a>
+          <span class="sha-tag">445bd410...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipm3-y62q0znlkwbtrxvrhwrkgjabofga9autgh2 samsung sm-s901b 2026:10:01 18:06:19.116 e798266a41fc77db359d14ece14ded247fa8fe2833419dbdae0f6fd94f5de89e">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipM3-y62Q0ZnlKWbTRXvRHWrKGJAboFga9auTGH2.jpg" alt="AF1QipM3-y62Q0ZnlKWbTRXvRHWrKGJAboFga9auTGH2" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">2.7 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:06:19.116</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipM3-y62Q0ZnlKWbTRXvRHWrKGJAboFga9auTGH2" target="_blank">&#8599; View</a>
+          <span class="sha-tag">e798266a...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipnk4_j9mhahnnaze1iz2b6y8jwzhcsrznvt-3dx samsung sm-s901b 2026:10:01 18:06:06.901 e62e7b04189d29453ab00a5c11b330830da735c93e042e97f0b7a6388cdf1407">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipNk4_J9MHAhnNAze1IZ2B6y8JWzHCsrzNVt-3dX.jpg" alt="AF1QipNk4_J9MHAhnNAze1IZ2B6y8JWzHCsrzNVt-3dX" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">2.8 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:06:06.901</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipNk4_J9MHAhnNAze1IZ2B6y8JWzHCsrzNVt-3dX" target="_blank">&#8599; View</a>
+          <span class="sha-tag">e62e7b04...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipmc4jxv2fa-8uts_or2spnt4ddbmdtxlejgqnuh samsung sm-s901b 2026:10:01 18:05:56.0993 4ce33bcf4e04ad80f1b902ac79e9c36ac94267fb0c45dfc1b12ab3fbc7c628c1">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipMC4jXV2fA-8UTS_Or2Spnt4DDBMdtxlEjGQnUH.jpg" alt="AF1QipMC4jXV2fA-8UTS_Or2Spnt4DDBMdtxlEjGQnUH" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">2.9 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:05:56.0993</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipMC4jXV2fA-8UTS_Or2Spnt4DDBMdtxlEjGQnUH" target="_blank">&#8599; View</a>
+          <span class="sha-tag">4ce33bcf...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipmoqagjdyy5pnkeontnuxaguzmzrd74jru0zuy3 samsung sm-s901b 2026:10:01 18:05:45.0655 cf2545a49913a25ddfe0ab9b0bd77a247c8f09ff7581e4aa89818e76e195da33">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipMOQaGjDYy5PNKeonTnUxAgUZmZrD74jRu0ZUY3.jpg" alt="AF1QipMOQaGjDYy5PNKeonTnUxAgUZmZrD74jRu0ZUY3" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">2.6 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:05:45.0655</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipMOQaGjDYy5PNKeonTnUxAgUZmZrD74jRu0ZUY3" target="_blank">&#8599; View</a>
+          <span class="sha-tag">cf2545a4...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipm7wdekeod_jj_yzikunsnlaxpusrln4hzgys0k samsung sm-s901b 2026:10:01 18:05:42.005 48e561d355da5b26ab84ee985be02bb247b9cc08dd7fa894c65ac3e039c4daa8">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipM7wdEkEOD_JJ_yZiKuNSNLaXpUsRln4Hzgys0K.jpg" alt="AF1QipM7wdEkEOD_JJ_yZiKuNSNLaXpUsRln4Hzgys0K" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">3.3 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:05:42.005</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipM7wdEkEOD_JJ_yZiKuNSNLaXpUsRln4Hzgys0K" target="_blank">&#8599; View</a>
+          <span class="sha-tag">48e561d3...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippc2vjv09paaryfhjoz1c_feye-l6jcretae8ht samsung sm-s901b 2026:10:01 18:05:06.251 c1afab3531c3c83d0a3651c0d9144d98739c3fd24af428184b16c13c62ae9a05">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPC2VJV09PaARYFHJOZ1C_feyE-l6JCREtaE8Ht.jpg" alt="AF1QipPC2VJV09PaARYFHJOZ1C_feyE-l6JCREtaE8Ht" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">3.4 MB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:05:06.251</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPC2VJV09PaARYFHJOZ1C_feyE-l6JCREtaE8Ht" target="_blank">&#8599; View</a>
+          <span class="sha-tag">c1afab35...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippukwee5q0b2booo0rvabgitx4bsxmfzseyfnbr   78547308bda1da40fe9a3bf3033ec98cbdc302dbf7bbbdcbc5b1aae2dbf7eda7">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPUKwEe5Q0b2BOoO0rVAbgiTX4BSxmfzsEYfnbr.jpg" alt="AF1QipPUKwEe5Q0b2BOoO0rVAbgiTX4BSxmfzsEYfnbr" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">nullxnull</span>
+          <span class="meta-pill">5.0 MB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">No EXIF Date</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPUKwEe5Q0b2BOoO0rVAbgiTX4BSxmfzsEYfnbr" target="_blank">&#8599; View</a>
+          <span class="sha-tag">78547308...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipndya-oaxb9xnryleghiy5kbyrwwsm4cgmfjo_c   3a74dd5e0622fe5b4c1e2cde84a00848423320916df3e04de2f3d4fe98c0adc4">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipNdYA-OAxB9xNrYleghIy5kBYrWWSm4CgmfJO_c.jpg" alt="AF1QipNdYA-OAxB9xNrYleghIy5kBYrWWSm4CgmfJO_c" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">1080x1350</span>
+          <span class="meta-pill">119.6 KB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">No EXIF Date</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipNdYA-OAxB9xNrYleghIy5kBYrWWSm4CgmfJO_c" target="_blank">&#8599; View</a>
+          <span class="sha-tag">3a74dd5e...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippdwczk1rtwpsbhh3nckelpy8jfuaryza9vsyxt   6c15cdc2c9dafe4b5c60fd137aa44590427d769e607ef3d6cb59ceb47e249e69">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPdwCZK1rTWPSbHH3ncKELPY8jFUaryzA9vSyXt.jpg" alt="AF1QipPdwCZK1rTWPSbHH3ncKELPY8jFUaryzA9vSyXt" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">nullxnull</span>
+          <span class="meta-pill">1.8 MB</span>
+        </div>
+        <div class="camera-row">&#128247; Unknown</div>
+        <div class="date-row">No EXIF Date</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPdwCZK1rTWPSbHH3ncKELPY8jFUaryzA9vSyXt" target="_blank">&#8599; View</a>
+          <span class="sha-tag">6c15cdc2...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippb4ukuc4elobvshbjbg5q912cdx8jjpzkpjwug samsung sm-s901b 2026:10:01 18:04:56.413 0bb4a830af3bfad04a1a13ed0e8961acc1b7befd374f0501bc95f4a9f8a83325">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPb4UKuC4elOBvSHbjbG5Q912CdX8jjpzkPjWUG.jpg" alt="AF1QipPb4UKuC4elOBvSHbjbG5Q912CdX8jjpzkPjWUG" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">538.5 KB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:04:56.413</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPb4UKuC4elOBvSHbjbG5Q912CdX8jjpzkPjWUG" target="_blank">&#8599; View</a>
+          <span class="sha-tag">0bb4a830...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipp1fe7_fevxafu9mlmxjdrekrzr3rms2yumtbmg samsung sm-s901b 2026:10:01 18:04:53.169 81f0e9f4987c86909dc18c61bf52c899d477d057a86c3eecd527afa39607e9d1">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipP1FE7_FEVXaFu9mlMxJdrEkrzr3RMs2yUmTbMg.jpg" alt="AF1QipP1FE7_FEVXaFu9mlMxJdrEkrzr3RMs2yUmTbMg" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">380.2 KB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:04:53.169</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipP1FE7_FEVXaFu9mlMxJdrEkrzr3RMs2yUmTbMg" target="_blank">&#8599; View</a>
+          <span class="sha-tag">81f0e9f4...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipn2nnaqlublq7othsfwxvpq3rsxzk6scyrdjvbb samsung sm-s901b 2026:10:01 18:04:50.245 40ca0386522c5bc29836958f687d08ee7fc22d2022d07f094113635604489c9c">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipN2NNAQLuBLq7OthSFWxVpq3RSxZk6scYrdJvbB.jpg" alt="AF1QipN2NNAQLuBLq7OthSFWxVpq3RSxZk6scYrdJvbB" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">533.9 KB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:04:50.245</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipN2NNAQLuBLq7OthSFWxVpq3RSxZk6scYrdJvbB" target="_blank">&#8599; View</a>
+          <span class="sha-tag">40ca0386...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qippm7drngu92hfdsfnfxhk_xbkx68jlednktzjp0 samsung sm-s901b 2026:10:01 18:04:46.0899 8f1ffc7f942b27ae45a938eca9639b91eba80f26e96a68f9c4addc09a5c8cb0a">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipPM7DrNGU92hFdsFnFXHK_xbkX68jLEDnktzJP0.jpg" alt="AF1QipPM7DrNGU92hFdsFnFXHK_xbkX68jLEDnktzJP0" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">425.6 KB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:04:46.0899</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipPM7DrNGU92hFdsFnFXHK_xbkX68jLEDnktzJP0" target="_blank">&#8599; View</a>
+          <span class="sha-tag">8f1ffc7f...</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card-keeper" data-category="keep" data-search="af1qipm_1jyt4elf_vtbhgzcxud3bs_lvrnurjbxcyxl samsung sm-s901b 2026:10:01 18:04:42.0627 f4f25188520088f9791284644cfff1972ddf8414020f52578724a7da4efadd69">
+      <div class="thumb-wrap">
+        <img src="thumbnails/AF1QipM_1Jyt4ELF_VTbHGzCxud3bs_LVrnuRJbXcYxL.jpg" alt="AF1QipM_1Jyt4ELF_VTbHGzCxud3bs_LVrnuRJbXcYxL" loading="lazy">
+        
+        <span class="badge badge-keeper">&#10004; ORIGINAL KEPT</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-pill">4000x3000</span>
+          <span class="meta-pill">552.7 KB</span>
+        </div>
+        <div class="camera-row">&#128247; samsung SM-S901B</div>
+        <div class="date-row">2026:10:01 18:04:42.0627</div>
+        <div class="card-footer">
+          <a class="btn-link" href="https://photos.google.com/photo/AF1QipM_1Jyt4ELF_VTbHGzCxud3bs_LVrnuRJbXcYxL" target="_blank">&#8599; View</a>
+          <span class="sha-tag">f4f25188...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentView = sessionStorage.getItem('gp_view') || 'all';
+let standardFilter = 'all';
+let autoRefreshTimer = null;
+let countdown = 3;
+let isPolling = true;
+
+window.addEventListener('DOMContentLoaded', () => {
+  const savedSearch = sessionStorage.getItem('gp_search') || '';
+  if (savedSearch) document.getElementById('searchBox').value = savedSearch;
+
+  const btn = document.querySelector(`.tab-btn[onclick*="'${currentView}'"]`);
+  if (btn) switchView(currentView, btn);
+
+  const savedScroll = sessionStorage.getItem('gp_scroll');
+  if (savedScroll) window.scrollTo(0, parseInt(savedScroll, 10));
+
+  startAutoRefresh();
+});
+
+window.addEventListener('beforeunload', () => {
+  sessionStorage.setItem('gp_scroll', window.scrollY);
+  sessionStorage.setItem('gp_search', document.getElementById('searchBox').value);
+  sessionStorage.setItem('gp_view', currentView);
+});
+
+function switchView(view, btn) {
+  currentView = view;
+  sessionStorage.setItem('gp_view', view);
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+
+  const groupsView = document.getElementById('duplicateGroupsView');
+  const gridView = document.getElementById('standardGrid');
+
+  if (view === 'groups') {
+    groupsView.style.display = 'block';
+    gridView.style.display = 'none';
+  } else {
+    groupsView.style.display = 'none';
+    gridView.style.display = 'grid';
+    standardFilter = 'all';
+    filterCards();
+  }
+}
+
+function filterStandard(filter, btn) {
+  currentView = 'grid';
+  sessionStorage.setItem('gp_view', 'grid');
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+
+  document.getElementById('duplicateGroupsView').style.display = 'none';
+  document.getElementById('standardGrid').style.display = 'grid';
+  standardFilter = filter.toLowerCase();
+  filterCards();
+}
+
+function handleSearch() {
+  sessionStorage.setItem('gp_search', document.getElementById('searchBox').value);
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+
+  if (currentView === 'groups') {
+    document.querySelectorAll('.dup-group').forEach(grp => {
+      const s = grp.getAttribute('data-search') || '';
+      grp.style.display = (!q || s.includes(q)) ? 'block' : 'none';
+    });
+  } else {
+    filterCards();
+  }
+}
+
+function filterCards() {
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+  document.querySelectorAll('#standardGrid .card').forEach(card => {
+    const cat = card.getAttribute('data-category') || '';
+    const s = card.getAttribute('data-search') || '';
+    const matchesCat = (standardFilter === 'all') || (cat === standardFilter);
+    const matchesQ = !q || s.includes(q);
+    card.style.display = (matchesCat && matchesQ) ? 'flex' : 'none';
+  });
+}
+
+function toggleAutoRefresh() {
+  isPolling = document.getElementById('autoRefreshToggle').checked;
+  const badge = document.getElementById('liveStatusBadge');
+  if (isPolling) {
+    badge.style.display = 'inline-flex';
+    startAutoRefresh();
+  } else {
+    badge.style.display = 'none';
+    if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  }
+}
+
+function startAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  countdown = 3;
+  autoRefreshTimer = setInterval(async () => {
+    if (!isPolling) return;
+    countdown--;
+    const cdEl = document.getElementById('refreshCountdown');
+    if (cdEl) cdEl.innerText = countdown + 's';
+
+    if (countdown <= 0) {
+      countdown = 3;
+      await checkUpdates();
+    }
+  }, 1000);
+}
+
+async function checkUpdates() {
+  try {
+    if (location.protocol.startsWith('http')) {
+      const res = await fetch('/api/data?t=' + Date.now(), { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        const currentCount = parseInt(document.querySelector('.metric-val').innerText, 10) || 0;
+        if (data.stats.total !== currentCount) {
+          sessionStorage.setItem('gp_scroll', window.scrollY);
+          sessionStorage.setItem('gp_search', document.getElementById('searchBox').value);
+          sessionStorage.setItem('gp_view', currentView);
+          location.reload();
+        }
+      }
+    } else {
+      sessionStorage.setItem('gp_scroll', window.scrollY);
+      sessionStorage.setItem('gp_search', document.getElementById('searchBox').value);
+      sessionStorage.setItem('gp_view', currentView);
+      location.reload();
+    }
+  } catch (e) {}
+}
+</script>
+</body>
+</html>

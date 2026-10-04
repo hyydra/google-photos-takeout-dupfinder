@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+venv/
+.venv/
+
+# Node & Playwright
+node_modules/
+.playwright/
+test-results/
+
+# Chrome user profile and temporary downloads
+gphotos/chrome-profile/
+gphotos/downloads/
+chrome-profile/
+downloads/
+
+# Databases and large data dumps
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-journal
+takeout_report.csv
+takeout_report.json
+run-log.tsv
+done.txt
+failed.txt
+
+# Generated thumbnails and screenshots
+gphotos/thumbnails/
+thumbnails/
+*.png
+*.jpg
+*.jpeg
+!assets/*.png
+!assets/*.jpg
+
+# OS artifacts
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
