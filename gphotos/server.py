@@ -160,6 +160,7 @@ def get_live_data():
         }
 
     items = []
+    trashed_ids = set((ROOT / 'trashed.txt').read_text(encoding='utf-8').split()) if (ROOT / 'trashed.txt').exists() else set()
     with open(LOG_FILE, 'r', encoding='utf-8') as f:
         for line in f:
             parts = line.rstrip('\r\n').split('\t')
@@ -168,6 +169,8 @@ def get_live_data():
             while len(parts) < 11:
                 parts.append('')
             pid, action, sha, sz_str, dims, dt, make, model, gp_dup, local_dup, prob = parts[:11]
+            if pid in trashed_ids:
+                action = 'TRASH'
             try:
                 sz = int(sz_str)
             except ValueError:

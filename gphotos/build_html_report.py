@@ -36,6 +36,8 @@ def generate_report(log_path, out_path, thumb_dir):
         return
 
     items = []
+    tp = log_path.parent / 'trashed.txt'
+    trashed_ids = set(tp.read_text(encoding='utf-8').split()) if tp.exists() else set()
     with open(log_path, 'r', encoding='utf-8') as f:
         for line in f:
             parts = line.rstrip('\r\n').split('\t')
@@ -44,6 +46,8 @@ def generate_report(log_path, out_path, thumb_dir):
             while len(parts) < 13:
                 parts.append('')
             pid, action, sha, sz_str, dims, dt, make, model, gp_dup, local_dup, prob = parts[:11]
+            if pid in trashed_ids:
+                action = 'TRASH'
             try:
                 sz = int(sz_str)
             except ValueError:
@@ -670,6 +674,8 @@ def generate_report(log_path, out_path, thumb_dir):
             d_pid = d['id']
             d_thumb = f"thumbnails/{d_pid}.jpg" if d['has_thumb'] else ""
             badge_text = {"TRASH": "DELETED (TRASH)", "PROBABLE_REVIEW": "SUSPECT (REVIEW)"}.get(d['action'], "WOULD TRASH")
+            if d['action'] == 'WOULD_TRASH' and d.get('local_dup') and not d.get('gp_dup_of'):
+                badge_text = "ALSO IN TAKEOUT"   # byte-identical to a local file, not a duplicate within Google Photos
             html_content += f"""
         <!-- RED CROSSED DUPLICATE CARD -->
         <div class="card card-duplicate">
@@ -722,7 +728,8 @@ def generate_report(log_path, out_path, thumb_dir):
         is_dup = action in ('TRASH', 'WOULD_TRASH', 'PROBABLE_REVIEW')
         card_cls = 'card-duplicate' if is_dup else 'card-keeper'
         badge_cls = 'badge-duplicate' if is_dup else 'badge-keeper'
-        badge_txt = '&#10006; DELETED' if action == 'TRASH' else ('&#10006; WOULD TRASH' if action == 'WOULD_TRASH' else '&#9888; SUSPECT (REVIEW)' if action == 'PROBABLE_REVIEW' else '&#10004; ORIGINAL KEPT')
+        also_local = action == 'WOULD_TRASH' and item.get('local_dup') and not item.get('gp_dup_of')
+        badge_txt = '&#10006; DELETED' if action == 'TRASH' else ('&#128190; ALSO IN TAKEOUT' if also_local else '&#10006; WOULD TRASH' if action == 'WOULD_TRASH' else '&#9888; SUSPECT (REVIEW)' if action == 'PROBABLE_REVIEW' else '&#10004; ORIGINAL KEPT')
 
         pid = item['id']
         thumb_file = f"thumbnails/{pid}.jpg"

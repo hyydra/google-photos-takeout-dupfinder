@@ -3,6 +3,7 @@
 CRC32 backfill helper for online photos that were scanned before CRC checksums existed.
 
   python gp_crc.py list <gphotos.sqlite>                  # JSON list of photo ids that still have no CRC
+  python gp_crc.py confirm <gphotos.sqlite>               # stdin [[id, ref],...] -> ids whose SHA-256 and CRC32 match the ref
   python gp_crc.py fix  <gphotos.sqlite> <id> <file>      # compute CRC32 + SHA-256 of a freshly downloaded
                                                           # original, store the CRC only if the SHA-256 still
                                                           # matches the recorded one, then delete the file
@@ -47,8 +48,18 @@ def main():
             db.commit()
         os.remove(fpath)
         print(json.dumps({"crc": crc, "sha_match": match}))
+    elif cmd == "confirm":
+        # stdin: JSON [[id, reference_id], ...]  ->  JSON list of ids whose SHA-256 AND CRC32 equal the reference's
+        pairs = json.load(sys.stdin)
+        out = []
+        for pid, ref in pairs:
+            a = db.execute("SELECT sha, crc FROM gp WHERE id=? AND status='ok'", (pid,)).fetchone()
+            b = db.execute("SELECT sha, crc FROM gp WHERE id=? AND status='ok'", (ref,)).fetchone()
+            if a and b and a[0] and a[0] == b[0] and a[1] and a[1] == b[1]:
+                out.append(pid)
+        print(json.dumps(out))
     else:
-        sys.exit("usage: gp_crc.py list|fix ...")
+        sys.exit("usage: gp_crc.py list|fix|confirm ...")
 
 
 if __name__ == "__main__":

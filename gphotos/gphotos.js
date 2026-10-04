@@ -19,7 +19,7 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawnSync } = require('child_process');
 const { promisify } = require('util');
 const execFileP = promisify(execFile);
 
@@ -234,13 +234,29 @@ async function run() {
   const done = new Set(lines(DONE));
   const statusById = new Map(lines(LOG).map((l) => l.split('\t')).map((c) => [c[0], c[1]]));
 
+  // Photos logged earlier as byte-identical duplicates (before auto-trash or CRC existed) are trashed as the scan
+  // passes them, but only when SHA-256 AND CRC32 both equal the kept original's. Results go to trashed.txt.
+  const TRASHED = path.join(ROOT, 'trashed.txt');
+  const alreadyTrashed = new Set(lines(TRASHED));
+  let sweep = new Set();
+  if (autoTrash) {
+    const pairs = lines(LOG).map((l) => l.split('\t'))
+      .filter((c) => c[1] === 'WOULD_TRASH' && c[8] && statusById.get(c[8]) === 'KEEP' && !alreadyTrashed.has(c[0]))
+      .map((c) => [c[0], c[8]]);
+    if (pairs.length) {
+      const r = spawnSync('python', ['gp_crc.py', 'confirm', DB], { cwd: ROOT, input: JSON.stringify(pairs), encoding: 'utf8', maxBuffer: 1 << 26 });
+      if (r.status === 0) sweep = new Set(JSON.parse(r.stdout.trim().split('\n').pop()));
+      log(`sweep: ${sweep.size} of ${pairs.length} earlier duplicates are confirmed by SHA-256 + CRC32 against their kept original`);
+    }
+  }
+
   log(`start (${autoTrash ? 'AUTO-TRASH on: byte-identical online duplicates go to the Google Photos trash' : 'log only'}) | limit ${limit === Infinity ? 'none' : limit} | takeout ${takeout || 'none'}`);
 
   const browser = await launch();
   const page = (await activePage(browser)) || (await browser.newPage());
   await openFirstPhoto(page);
 
-  let count = 0, videos = 0, failedNext = 0, fastForwarded = 0;
+  let count = 0, videos = 0, failedNext = 0, fastForwarded = 0, swept = 0;
 
   while (count < limit && failedNext < END_AFTER_FAILED_NEXT) {
     const id = idFromUrl(page.url());
@@ -248,7 +264,21 @@ async function run() {
 
     let trashed = false;
     if (done.has(id)) {
-      if (++fastForwarded % 50 === 0) log(`fast-forwarded ${fastForwarded} already-done photos`);
+      if (sweep.has(id) && !alreadyTrashed.has(id)) {
+        try {
+          await waitForViewer(page);
+          await sleep(800);
+          if (idFromUrl(page.url()) === id && (await trashCurrent(page))) {
+            fs.appendFileSync(TRASHED, id + '\n');
+            alreadyTrashed.add(id);
+            trashed = true;
+            swept++;
+            log(`swept ${id.slice(0, 12)}… (SHA-256 + CRC32 match the kept original) -> Google Photos trash [${swept}]`);
+          }
+        } catch (e) {
+          log(`sweep skipped ${id.slice(0, 12)}…: ${e.message}`);
+        }
+      } else if (++fastForwarded % 50 === 0) log(`fast-forwarded ${fastForwarded} already-done photos`);
     } else {
       try {
         trashed = await withTimeout((async () => {
