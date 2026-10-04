@@ -145,7 +145,9 @@ def scan(args):
             todo.append(p)
     print(f"cached: {len(rows)}  to process: {len(todo)}", file=sys.stderr)
     t0 = time.time()
-    with ThreadPoolExecutor(args.workers) as ex:
+    args.incomplete = False
+    ex = ThreadPoolExecutor(args.workers)
+    try:
         for i, r in enumerate(ex.map(lambda p: safe(process, p), todo), 1):
             if r:
                 db.execute("INSERT OR REPLACE INTO f VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
@@ -153,6 +155,11 @@ def scan(args):
             if i % 200 == 0:
                 db.commit()
                 print(f"  {i}/{len(todo)}  {time.time()-t0:.0f}s", file=sys.stderr)
+            if args.max_seconds and time.time() - t0 > args.max_seconds and i < len(todo):
+                args.incomplete = True      # chunked run: stop cleanly, everything hashed so far is committed
+                break
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
     db.commit()
     return rows
 
@@ -240,10 +247,15 @@ def main():
     s.add_argument("--out", default="duplicates")
     s.add_argument("--db", default="dupcache.sqlite")
     s.add_argument("--workers", type=int, default=8)
+    s.add_argument("--max-seconds", type=int, default=0, help="stop cleanly after this many seconds of hashing (chunked runs); run again to continue")
     s.add_argument("--quarantine")
     s.add_argument("--keep", default="oldest", choices=["oldest", "newest", "shortest", "largest"])
     a = ap.parse_args()
     rows = scan(a)
+    if getattr(a, "incomplete", False):
+        print("time budget reached: everything hashed so far is saved. Run the same command again to continue "
+              "(reports and --quarantine only run after a complete pass).", file=sys.stderr)
+        return
     exact, probable, pixel = group(rows)
     write_reports(exact, probable, pixel, a.out)
     if a.quarantine:

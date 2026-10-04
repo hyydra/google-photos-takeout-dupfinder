@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--go", action="store_true", help="really send files to the Recycle Bin (default: dry run)")
     ap.add_argument("--max-groups", type=int, default=0, help="stop after this many groups (pilot run)")
     ap.add_argument("--batch", type=int, default=100, help="groups per Recycle Bin batch")
+    ap.add_argument("--max-seconds", type=int, default=0, help="stop cleanly between batches after this many seconds (chunked runs)")
     ap.add_argument("--verify", default="stat+crc", choices=["stat", "stat+crc", "hash"],
                     help="check before a file is touched: stat+crc (default) = size/mtime match the index AND its "
                          "CRC32 equals the kept copy's; stat = size/mtime only; hash = full SHA-256")
@@ -54,6 +55,9 @@ def main():
     budgets, moved, moved_bytes, skipped, errors, t0 = {}, 0, 0, 0, 0, time.time()
     reasons, examples = {}, {}
     for i in range(0, len(groups), a.batch):
+        if a.max_seconds and time.time() - t0 > a.max_seconds:
+            print(f"time budget reached after {i:,} groups; stopping cleanly (resume by running it again)")
+            break
         shas = [g[0] for g in groups[i:i + a.batch]]
         try:
             r = lt.trash_groups(a.takeout, shas, verify=a.verify, budgets=budgets)
