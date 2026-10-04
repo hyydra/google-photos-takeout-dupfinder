@@ -225,14 +225,16 @@ function rebuildReport() {
 async function run() {
   const takeout = flagVal('--takeout');
   if (process.argv.includes('--delete-gp-dups') || process.argv.includes('--delete-local-dups')) {
-    console.error('Automatic trashing was removed. Review and mark duplicates in the dashboard, then run: node gphotos.js trash --confirm <count>');
+    console.error('--delete-gp-dups / --delete-local-dups no longer exist. Use --auto-trash (byte-identical online duplicates only), or mark duplicates in the dashboard and run: node gphotos.js trash --confirm <count>');
     process.exit(2);
   }
   const keep = process.argv.includes('--keep');
+  const autoTrash = process.argv.includes('--auto-trash');
   const limit = Number(flagVal('--limit')) || Infinity;
   const done = new Set(lines(DONE));
+  const statusById = new Map(lines(LOG).map((l) => l.split('\t')).map((c) => [c[0], c[1]]));
 
-  log(`start (log only, never trashes) | limit ${limit === Infinity ? 'none' : limit} | takeout ${takeout || 'none'}`);
+  log(`start (${autoTrash ? 'AUTO-TRASH on: byte-identical online duplicates go to the Google Photos trash' : 'log only'}) | limit ${limit === Infinity ? 'none' : limit} | takeout ${takeout || 'none'}`);
 
   const browser = await launch();
   const page = (await activePage(browser)) || (await browser.newPage());
@@ -244,11 +246,12 @@ async function run() {
     const id = idFromUrl(page.url());
     if (!id) { await sleep(500); failedNext++; continue; }
 
+    let trashed = false;
     if (done.has(id)) {
       if (++fastForwarded % 50 === 0) log(`fast-forwarded ${fastForwarded} already-done photos`);
     } else {
       try {
-        await withTimeout((async () => {
+        trashed = await withTimeout((async () => {
           if ((await waitForViewer(page)) === 'video') throw new VideoSkip();
           const file = await downloadOriginal(page, id);
           let target = file;
@@ -262,17 +265,27 @@ async function run() {
           if (!v.w || !v.h) throw new VideoSkip(); // not a readable image
 
           // WOULD_TRASH = byte-identical to another photo; PROBABLE_REVIEW = same pixels / near-identical /
-          // same EXIF but different bytes. Both are only logged, for review in the dashboard.
+          // same EXIF but different bytes (never auto-trashed, only logged for review in the dashboard).
           let action = 'KEEP';
           if (v.gp_dup_of || v.local_dup) action = 'WOULD_TRASH';
           else if (v.probable) action = 'PROBABLE_REVIEW';
 
+          // Auto-trash: only a byte-identical (SHA-256 + size) copy of an online photo that was kept.
+          let didTrash = false;
+          if (autoTrash && action === 'WOULD_TRASH' && v.gp_dup_of && v.sha && v.size > 0 && v.crc_confirmed
+              && statusById.get(v.gp_dup_of) === 'KEEP') {
+            didTrash = await trashCurrent(page);
+            if (didTrash) action = 'TRASH';
+          }
+          statusById.set(id, action);
+
           fs.appendFileSync(LOG, [id, action, v.sha, v.size, `${v.w}x${v.h}`, v.dt, v.make, v.model,
-            v.gp_dup_of || '', v.local_dup || '', v.probable || '', v.reason || ''].join('\t') + '\n');
+            v.gp_dup_of || '', v.local_dup || '', v.probable || '', v.reason || '', v.crc || ''].join('\t') + '\n');
           fs.appendFileSync(DONE, id + '\n');
           done.add(id);
           count++;
           log(`#${count} ${id.slice(0, 12)}… ${action}${v.reason ? ' (' + v.reason + ')' : ''} ${v.w}x${v.h}`);
+          return didTrash;
         })(), PHOTO_DEADLINE_MS, `photo ${id}`);
       } catch (e) {
         fs.appendFileSync(DONE, id + '\n');
@@ -289,7 +302,8 @@ async function run() {
       if (count > 0 && count % REPORT_EVERY === 0) await rebuildReport();
     }
 
-    const moved = await goNext(page, id);
+    if (trashed) await sleep(1000); // after a trash Google Photos moves to the next photo by itself
+    const moved = trashed && idFromUrl(page.url()) !== id ? true : await goNext(page, id);
     failedNext = moved ? 0 : failedNext + 1;
     if (!moved) log(`could not advance from ${id.slice(0, 12)}… (${failedNext}/${END_AFTER_FAILED_NEXT})`);
   }
@@ -356,13 +370,54 @@ async function trashMarked() {
   await browser.close();
 }
 
+// Download every online photo that was scanned before CRC32 existed, check its SHA-256 still matches the
+// recorded one, and store the CRC32. Needed so old photos can act as a CRC-confirmed reference.
+async function backfillCrc() {
+  const scanCount = await execFileP('powershell', ['-NoProfile', '-Command',
+    "(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*gphotos.js*' -and $_.CommandLine -like '* run*' } | Measure-Object).Count"])
+    .then((r) => parseInt(r.stdout, 10) || 0).catch(() => 0);
+  if (scanCount > 0) {
+    console.log('A scan is running and holds the Chrome profile. Stop it first, then run backfill-crc again.');
+    return;
+  }
+  const { stdout } = await execFileP('python', ['gp_crc.py', 'list', DB], { cwd: ROOT, timeout: 120000 });
+  const ids = JSON.parse(stdout.trim().split('\n').pop());
+  log(`backfill-crc: ${ids.length} photo(s) without a CRC`);
+  if (!ids.length) return;
+  const limit = Number(flagVal('--limit')) || Infinity;
+
+  const browser = await launch();
+  const page = (await activePage(browser)) || (await browser.newPage());
+  let ok = 0, mismatch = 0, failed = 0;
+  for (const id of ids.slice(0, limit)) {
+    try {
+      await withTimeout((async () => {
+        await page.goto(`https://photos.google.com/photo/${id}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        if (idFromUrl(page.url()) !== id) throw new Error('viewer opened a different photo');
+        if ((await waitForViewer(page)) === 'video') throw new Error('is a video');
+        const file = await downloadOriginal(page, id);
+        const { stdout: out } = await execFileP('python', ['gp_crc.py', 'fix', DB, id, file], { cwd: ROOT, timeout: 180000 });
+        const r = JSON.parse(out.trim().split('\n').pop());
+        if (r.sha_match) { ok++; } else { mismatch++; log(`SHA-256 differs from the recorded one for ${id.slice(0, 12)}… (CRC not stored)`); }
+      })(), PHOTO_DEADLINE_MS, `crc ${id}`);
+      if ((ok + mismatch + failed) % 25 === 0) log(`crc backfill: ${ok} stored, ${mismatch} sha mismatches, ${failed} failed of ${ids.length}`);
+    } catch (e) {
+      failed++;
+      log(`crc FAILED ${id.slice(0, 12)}…: ${e.message}`);
+    }
+  }
+  log(`crc backfill done: ${ok} stored, ${mismatch} sha mismatches, ${failed} failed`);
+  browser.removeAllListeners('disconnected');
+  await browser.close();
+}
+
 async function report() {
   await rebuildReport();
   log(`report ready: ${path.join(ROOT, 'report.html')}`);
 }
 
 const cmd = process.argv[2] || 'run';
-(cmd === 'report' ? report() : cmd === 'trash' ? trashMarked() : run()).catch((e) => {
+(cmd === 'report' ? report() : cmd === 'trash' ? trashMarked() : cmd === 'backfill-crc' ? backfillCrc() : run()).catch((e) => {
   console.error('\n[FATAL]', e.message);
   process.exit(1);
 });

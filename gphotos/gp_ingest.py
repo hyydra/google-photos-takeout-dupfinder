@@ -17,7 +17,7 @@ Match tiers, strongest first (only the first, byte-identical SHA-256, may ever b
   exif     same dimensions + EXIF capture time/camera/unique id
 The first-seen GP item with a given SHA is the keeper; later ones report gp_dup_of.
 """
-import json, os, sqlite3, sys
+import json, os, sqlite3, sys, zlib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dupfinder import sha256, read_meta, content_hashes, hamming
@@ -28,7 +28,7 @@ SIMILAR_MAX = 4  # of 64 dHash bits
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS gp(
  id TEXT PRIMARY KEY, url TEXT, filename TEXT, size INT, sha TEXT, w INT, h INT,
- dt TEXT, make TEXT, model TEXT, uid TEXT, status TEXT, pix TEXT, dh TEXT)"""
+ dt TEXT, make TEXT, model TEXT, uid TEXT, status TEXT, pix TEXT, dh TEXT, crc TEXT)"""
 
 
 def save_thumb(src_path, dst_path, size=(480, 480)):
@@ -42,6 +42,15 @@ def save_thumb(src_path, dst_path, size=(480, 480)):
             thumb.save(dst_path, "JPEG", quality=85)
     except Exception:
         pass
+
+
+def file_crc32(path):
+    """CRC32 of the file bytes as 8 hex digits (a second, independent checksum next to SHA-256)."""
+    crc = 0
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            crc = zlib.crc32(chunk, crc)
+    return f"{crc & 0xFFFFFFFF:08x}"
 
 
 def columns(db, table):
@@ -66,7 +75,7 @@ def main():
     takeout = sys.argv[sys.argv.index("--takeout") + 1] if "--takeout" in sys.argv else None
     db = sqlite3.connect(db_path)
     db.execute(SCHEMA)
-    for c in ("pix", "dh"):
+    for c in ("pix", "dh", "crc"):
         if c not in columns(db, "gp"):
             db.execute(f"ALTER TABLE gp ADD COLUMN {c} TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_gp_sha ON gp(sha)")
@@ -76,6 +85,7 @@ def main():
     w, h, dt, make, model, uid = read_meta(fpath)
     pix, dh = content_hashes(fpath)
     sha, size = sha256(fpath), os.path.getsize(fpath)
+    crc = file_crc32(fpath)
 
     # Save thumbnail for this Google Photos item
     thumb_dir = Path(db_path).resolve().parent / "thumbnails"
@@ -87,8 +97,10 @@ def main():
         tcols = columns(t, "f")
 
     # Tier 1: byte-identical
-    r = db.execute("SELECT id FROM gp WHERE sha=? AND id<>? AND status='ok' LIMIT 1", (sha, pid)).fetchone()
+    r = db.execute("SELECT id, crc FROM gp WHERE sha=? AND id<>? AND status='ok' LIMIT 1", (sha, pid)).fetchone()
     gp_dup = r[0] if r else None
+    # Both checksums must agree before a copy counts as confirmed (rows scanned before CRC existed have none).
+    crc_confirmed = bool(r and r[1] and r[1] == crc)
     local_dup = probable = reason = None
     if t:
         r = t.execute("SELECT path FROM f WHERE sha=? LIMIT 1", (sha,)).fetchone()
@@ -131,15 +143,15 @@ def main():
     if local_ref and os.path.exists(local_ref):
         save_thumb(Path(local_ref), thumb_dir / f"local_{sha[:12]}.jpg")
 
-    db.execute("INSERT OR REPLACE INTO gp(id,url,filename,size,sha,w,h,dt,make,model,uid,status,pix,dh) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT OR REPLACE INTO gp(id,url,filename,size,sha,w,h,dt,make,model,uid,status,pix,dh,crc) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (pid, f"https://photos.google.com/photo/{pid}", os.path.basename(fpath),
-                size, sha, w, h, dt, make, model, uid, "ok", pix, dh))
+                size, sha, w, h, dt, make, model, uid, "ok", pix, dh, crc))
     db.commit()
     if not keep:
         os.remove(fpath)
     print(json.dumps({"sha": sha, "size": size, "w": w, "h": h, "dt": dt, "make": make, "model": model,
-                      "pix": pix, "gp_dup_of": gp_dup, "local_dup": local_dup,
+                      "pix": pix, "crc": crc, "crc_confirmed": crc_confirmed, "gp_dup_of": gp_dup, "local_dup": local_dup,
                       "probable": probable, "reason": reason}))
 
 

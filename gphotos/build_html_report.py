@@ -41,7 +41,7 @@ def generate_report(log_path, out_path, thumb_dir):
             parts = line.rstrip('\r\n').split('\t')
             if not parts or not parts[0]:
                 continue
-            while len(parts) < 12:
+            while len(parts) < 13:
                 parts.append('')
             pid, action, sha, sz_str, dims, dt, make, model, gp_dup, local_dup, prob = parts[:11]
             try:
@@ -76,6 +76,7 @@ def generate_report(log_path, out_path, thumb_dir):
                 "local_dup": local_dup,
                 "probable": prob,
                 "reason": parts[11],
+                "crc": parts[12],
                 "has_thumb": (thumb_dir / f"{pid}.jpg").exists(),
                 "has_local_thumb": (thumb_dir / f"local_{sha[:12]}.jpg").exists() if local_dup else False,
             })
@@ -356,8 +357,8 @@ def generate_report(log_path, out_path, thumb_dir):
   /* Grid of cards inside group */
   .group-cards-row {{
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
-    gap: 18px;
+    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+    gap: 12px;
   }}
 
   /* Photo Card Base */
@@ -492,9 +493,15 @@ def generate_report(log_path, out_path, thumb_dir):
   /* Standard Grid */
   .photo-grid {{
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
-    gap: 20px;
+    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+    gap: 12px;
   }}
+  /* compact previews */
+  .card .card-body {{ padding: 8px 10px; }}
+  .card .camera-row, .card .date-row {{ font-size: 11px; }}
+  .card .meta-pill {{ font-size: 10px; padding: 1px 6px; }}
+  .card .badge {{ font-size: 9px; padding: 2px 6px; }}
+  .card .btn-link, .card .sha-tag {{ font-size: 10px; }}
   .dup-group.suspicious {{ border: 2px solid #f59e0b; }}
   .dup-group.suspicious .group-badge-title {{ background: #f59e0b; color: #000; }}
   .mark-box {{ display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 8px;
@@ -627,7 +634,7 @@ def generate_report(log_path, out_path, thumb_dir):
             <div class="date-row">{html.escape(k['dt'])}</div>
             <div class="card-footer">
               <a class="btn-link" href="https://photos.google.com/photo/{k_pid}" target="_blank">&#8599; View Original</a>
-              <span class="sha-tag">{k['sha'][:8]}...</span>
+              <span class="sha-tag" title="SHA-256 / CRC32">{k['sha'][:8]}...{' crc ' + k['crc'] if k.get('crc') else ''}</span>
             </div>
           </div>
         </div>"""
@@ -680,7 +687,7 @@ def generate_report(log_path, out_path, thumb_dir):
             {mark_box(d)}
             <div class="card-footer">
               <a class="btn-link" href="https://photos.google.com/photo/{d_pid}" target="_blank">&#8599; View in Photos</a>
-              <span class="sha-tag">{d['sha'][:8]}...</span>
+              <span class="sha-tag" title="SHA-256 / CRC32">{d['sha'][:8]}...{' crc ' + d['crc'] if d.get('crc') else ''}</span>
             </div>
           </div>
         </div>"""
@@ -697,6 +704,7 @@ def generate_report(log_path, out_path, thumb_dir):
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px;">
       <button class="tab-btn active" id="localKindExact" onclick="setLocalKind('exact')">Exact (same SHA-256)</button>
       <button class="tab-btn" id="localKindPixel" onclick="setLocalKind('pixel')">Same pixels, different file</button>
+      <button class="tab-btn" id="localKindRecycled" onclick="setLocalKind('recycled')">Deleted (Recycle Bin)</button>
       <span id="localStats" style="color:var(--text-secondary); font-size:13px;"></span>
     </div>
     <div id="localGroups"></div>
@@ -737,7 +745,7 @@ def generate_report(log_path, out_path, thumb_dir):
         {mark_box(item)}
         <div class="card-footer">
           <a class="btn-link" href="https://photos.google.com/photo/{pid}" target="_blank">&#8599; View</a>
-          <span class="sha-tag">{item['sha'][:8]}...</span>
+          <span class="sha-tag" title="SHA-256 / CRC32">{item['sha'][:8]}...{' crc ' + item['crc'] if item.get('crc') else ''}</span>
         </div>
       </div>
     </div>"""
@@ -953,6 +961,7 @@ function setLocalKind(kind) {
   localKind = kind;
   document.getElementById('localKindExact').classList.toggle('active', kind === 'exact');
   document.getElementById('localKindPixel').classList.toggle('active', kind === 'pixel');
+  document.getElementById('localKindRecycled').classList.toggle('active', kind === 'recycled');
   loadLocal(true);
 }
 function imgFail(img) {
@@ -960,6 +969,16 @@ function imgFail(img) {
   d.className = 'thumb-placeholder';
   d.innerHTML = '<span>&#128247;</span><span>No preview</span>';
   img.replaceWith(d);
+}
+function recycledCard(f, keeper, keptPath) {
+  const name = f.path.split(String.fromCharCode(92)).pop().split('/').pop();
+  const thumb = '/local-thumb?path=' + encodeURIComponent(keptPath); // identical bytes: the kept copy looks the same
+  return '<div class="card ' + (keeper ? 'card-keeper' : 'card-duplicate') + '"><div class="thumb-wrap">'
+    + '<img loading="lazy" src="' + thumb + '" onerror="imgFail(this)">' + (keeper ? '' : CROSS)
+    + '<span class="badge ' + (keeper ? 'badge-keeper' : 'badge-duplicate') + '">' + (keeper ? '&#10004; KEPT' : '&#10006; IN RECYCLE BIN') + '</span></div>'
+    + '<div class="card-body"><div class="meta-row">' + (f.size ? '<span class="meta-pill">' + fmtBytes(f.size) + '</span>' : '') + '</div>'
+    + '<div class="camera-row" title="' + esc(f.path) + '">&#128190; ' + esc(name) + '</div>'
+    + '<div class="date-row" title="' + esc(f.path) + '" style="font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(f.path) + '</div></div></div>';
 }
 function localCard(f, keeper) {
   const name = f.path.split(String.fromCharCode(92)).pop().split('/').pop();
@@ -980,17 +999,26 @@ async function loadLocal(reset) {
   const box = document.getElementById('localGroups'), more = document.getElementById('localMore'), stats = document.getElementById('localStats');
   if (reset) { localOffset = 0; box.innerHTML = ''; stats.textContent = 'Loading...'; }
   try {
-    const r = await fetch('/api/local?kind=' + localKind + '&offset=' + localOffset + '&limit=' + LOCAL_PAGE, { cache: 'no-store' });
+    const url = localKind === 'recycled' ? '/api/recycled?offset=' + localOffset + '&limit=' + LOCAL_PAGE : '/api/local?kind=' + localKind + '&offset=' + localOffset + '&limit=' + LOCAL_PAGE;
+    const r = await fetch(url, { cache: 'no-store' });
     const d = await r.json();
     localTotal = d.total || 0;
     document.getElementById('localCount').textContent = localTotal;
-    stats.textContent = (d.files_total || 0).toLocaleString() + ' local files indexed (' + (d.files_hashed || 0).toLocaleString() + ' content-hashed) · '
+    stats.textContent = localKind === 'recycled' ? (d.files || 0).toLocaleString() + ' duplicate files in ' + localTotal.toLocaleString() + ' groups sent to the Recycle Bin (' + fmtBytes(d.bytes || 0) + ', restorable from the bin)' : (d.files_total || 0).toLocaleString() + ' local files indexed (' + (d.files_hashed || 0).toLocaleString() + ' content-hashed) · '
       + localTotal.toLocaleString() + ' ' + (localKind === 'exact' ? 'exact' : 'same-pixel') + ' groups'
       + (localKind === 'exact' ? ' · ' + fmtBytes(d.reclaim_bytes || 0) + ' reclaimable' : '');
     if (!localTotal && reset) box.innerHTML = '<div style="text-align:center; padding:50px; color:var(--text-muted);">No ' + (localKind === 'exact' ? 'exact' : 'same-pixel') + ' groups found yet.' + (localKind === 'pixel' ? ' Pixel hashes are still being computed for the local archive.' : '') + '</div>';
     (d.groups || []).forEach((g, i) => {
       const num = localOffset + i + 1;
       const files = g.files || [];
+      if (localKind === 'recycled') {
+        box.insertAdjacentHTML('beforeend',
+          '<div class="dup-group exact"><div class="dup-group-header"><div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">'
+          + '<span class="group-badge-title">DELETED GROUP #' + num + '</span><span class="sha-tag">SHA-256: ' + esc(String(g.sha).slice(0, 16)) + '...</span></div>'
+          + '<div class="group-meta"><span>' + files.length + ' sent to the Recycle Bin</span> &bull; <span>' + esc(g.time) + '</span></div></div>'
+          + '<div class="group-cards-row">' + recycledCard({ path: g.kept, size: 0 }, true, g.kept) + files.map(f => recycledCard(f, false, g.kept)).join('') + '</div></div>');
+        return;
+      }
       box.insertAdjacentHTML('beforeend',
         '<div class="dup-group ' + (localKind === 'exact' ? 'exact' : 'suspicious') + '">'
         + '<div class="dup-group-header"><div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;"><span class="group-badge-title">LOCAL GROUP #' + num + '</span>'

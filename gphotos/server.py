@@ -66,7 +66,7 @@ def local_thumb(path):
         try:
             with Image.open(path) as im:
                 im = ImageOps.exif_transpose(im)
-                im.thumbnail((360, 360))
+                im.thumbnail((240, 240))
                 im.convert("RGB").save(out, "JPEG", quality=80)
         except Exception:
             return None
@@ -83,52 +83,18 @@ def file_sha256(path):
             h.update(chunk)
     return h.hexdigest()
 
-def delete_local_group(sha):
-    """'Delete' the duplicates of one byte-identical local group: keep the oldest copy and MOVE the others
-    into <drive>:/takeout-dupes (same drive, reversible, logged). Every file is re-verified by SHA-256
-    right before it is moved; anything that no longer matches the index is left alone."""
-    if not SHA_RE.match(sha or ""):
-        raise ValueError("bad checksum")
+def delete_local_group(sha, verify="hash"):
+    """Send the duplicates of one byte-identical local group to the Windows Recycle Bin (oldest copy kept).
+    All the safety checks (capacity, path length, per-batch verification) live in localtrash.py."""
+    import localtrash
     with DB_LOCK:
-        ro = takeout_conn()
-        if not ro:
-            raise ValueError("takeout index not found")
-        rows = ro.execute("SELECT path FROM f WHERE sha=? ORDER BY mtime, LENGTH(path)", (sha,)).fetchall()
-        paths = [r[0] for r in rows]
-        if len(paths) < 2:
-            raise ValueError("this is no longer a duplicate group")
-        keeper = paths[0]
-        if not os.path.exists(keeper) or file_sha256(keeper) != sha:
-            raise ValueError("the copy to keep is missing or changed on disk; nothing was moved")
-        moved, skipped = [], []
-        for src in paths[1:]:
-            try:
-                if not os.path.exists(src):
-                    skipped.append([src, "missing"])
-                    continue
-                if file_sha256(src) != sha:
-                    skipped.append([src, "content no longer matches the index"])
-                    continue
-                qdir = Path(os.environ.get("QUARANTINE_DIR") or (os.path.splitdrive(src)[0] + os.sep + "takeout-dupes"))
-                qdir.mkdir(parents=True, exist_ok=True)
-                dst = qdir / f"{sha[:8]}_{Path(src).name}"
-                n = 1
-                while dst.exists():
-                    dst = qdir / f"{sha[:8]}_{n}_{Path(src).name}"
-                    n += 1
-                shutil.move(src, str(dst))
-                with open(QUARANTINE_LOG, "a", encoding="utf-8") as lf:
-                    lf.write(f"{time.strftime('%F %T')}\t{sha}\t{src}\t{dst}\t{keeper}\n")
-                moved.append([src, str(dst)])
-            except Exception as e:
-                skipped.append([src, str(e)])
-        if moved:
-            rw = sqlite3.connect(str(TAKEOUT_DB), timeout=60)
-            rw.executemany("DELETE FROM f WHERE path=?", [(m[0],) for m in moved])
-            rw.commit()
-            rw.close()
+        try:
+            result = localtrash.trash_group(TAKEOUT_DB, sha, verify=verify)
+        except localtrash.BinBreaker as e:
+            raise ValueError("Recycle Bin safety check stopped this: " + str(e))
+        if result["moved"]:
             _local_cache.clear()
-    return {"ok": True, "kept": keeper, "moved": moved, "skipped": skipped}
+    return result
 
 def scan_running():
     """True while a `gphotos.js run` scan is alive (it owns the Chrome profile)."""
@@ -300,6 +266,29 @@ class LiveHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json(local_groups(kind, offset, limit))
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
+            return
+        elif parsed.path == '/api/recycled':
+            import localtrash
+            q = urllib.parse.parse_qs(parsed.query)
+            try:
+                self.send_json(localtrash.read_log_groups(max(0, int(q.get('offset', ['0'])[0])), min(50, max(1, int(q.get('limit', ['10'])[0])))))
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+        elif parsed.path == '/recycled-thumb':
+            import localtrash
+            path = urllib.parse.parse_qs(parsed.query).get('path', [''])[0]
+            tp = localtrash.thumb_path(path) if path in localtrash.logged_paths() else None
+            if not tp or not tp.exists():
+                self.send_error(404)
+                return
+            data = tp.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'max-age=86400')
+            self.end_headers()
+            self.wfile.write(data)
             return
         elif parsed.path == '/local-thumb':
             thumb = local_thumb(urllib.parse.parse_qs(parsed.query).get('path', [''])[0])
