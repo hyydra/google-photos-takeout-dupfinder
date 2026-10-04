@@ -134,7 +134,10 @@ def scan(args):
     cached = {r[0]: r for r in db.execute("SELECT * FROM f")}
     todo, rows = [], []
     for p in walk(args.paths):
-        st = os.stat(p)
+        try:
+            st = os.stat(p)
+        except OSError:      # moved away (e.g. to the Recycle Bin by the clean-up) between the walk and now
+            continue
         c = cached.get(str(p))
         if c and c[1] == st.st_size and c[2] == st.st_mtime and c[10] is not None and c[12] is not None:  # NULL pix/crc = not fully hashed yet
             rows.append(c)

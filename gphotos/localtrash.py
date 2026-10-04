@@ -227,6 +227,22 @@ def bin_count(root):
     return n
 
 
+def _recycle_robust(paths):
+    """Send paths to the Recycle Bin. The shell aborts a whole batch when it chokes on one item, so when files
+    are left behind retry them in halves until the offending file is isolated.
+    Returns {path: shell error code} for the files that could not be sent."""
+    code = _shell_recycle(paths)
+    left = [p for p in paths if os.path.exists(p)]
+    if not left:
+        return {}
+    if len(left) == 1:
+        return {left[0]: code}
+    mid = len(left) // 2
+    errs = _recycle_robust(left[:mid])
+    errs.update(_recycle_robust(left[mid:]))
+    return errs
+
+
 class BinBudget:
     """Tracks how many more bytes the drive's Recycle Bin can take without purging anything."""
     def __init__(self, root):
@@ -302,7 +318,7 @@ def trash_groups(takeout_db, shas, verify="hash", budgets=None, chunk=300):
         budgets[root].take(sum(b[1] for b in batch))
         # no per-file preview: a deleted copy is byte-identical to the kept one, the dashboard shows that one
         before = bin_count(root)
-        _shell_recycle([b[0] for b in batch])
+        errs = _recycle_robust([b[0] for b in batch])
         gone = [b for b in batch if not os.path.exists(b[0])]
         gained = bin_count(root) - before
         if gone and gained < len(gone):
@@ -315,7 +331,7 @@ def trash_groups(takeout_db, shas, verify="hash", budgets=None, chunk=300):
         db_delete(takeout_db, [b[0] for b in gone])
         for src, size, sha, keeper, crc in batch:
             if os.path.exists(src):
-                skipped.append([src, "could not be sent to the Recycle Bin (left in place)"])
+                skipped.append([src, f"Recycle Bin refused it, shell error {errs.get(src)} (left in place)"])
             else:
                 moved.append([src, size])
                 total += size

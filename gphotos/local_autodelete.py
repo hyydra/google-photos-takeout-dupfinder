@@ -11,7 +11,7 @@ long paths are skipped, each file is checked (size + mtime against the index) be
 aborts the moment the Recycle Bin does not receive exactly what was removed. Every file is logged to
 recycled-log.tsv and listed in the dashboard's Local Takeout > Deleted view.
 """
-import argparse, sqlite3, sys, time
+import argparse, re, sqlite3, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,6 +52,7 @@ def main():
     db.close()
 
     budgets, moved, moved_bytes, skipped, errors, t0 = {}, 0, 0, 0, 0, time.time()
+    reasons, examples = {}, {}
     for i in range(0, len(groups), a.batch):
         shas = [g[0] for g in groups[i:i + a.batch]]
         try:
@@ -61,8 +62,15 @@ def main():
             print(f"so far: {moved:,} files / {moved_bytes / 1e9:.2f} GB moved. Nothing further was touched.")
             return 2
         moved += len(r["moved"]); moved_bytes += r["bytes"]; skipped += len(r["skipped"]); errors += len(r["errors"])
+        for path, why in r["skipped"]:     # group the reasons (checksums stripped) and keep one example each
+            key = re.sub(r"[0-9a-f]{8}", "<crc>", why)[:80]
+            reasons[key] = reasons.get(key, 0) + 1
+            examples.setdefault(key, path)
         print(f"  {min(i + a.batch, len(groups)):,}/{len(groups):,} groups | {moved:,} files, "
               f"{moved_bytes / 1e9:.2f} GB in the bin | skipped {skipped} | stale groups {errors} | {time.time() - t0:.0f}s", flush=True)
+        if reasons and ((i // a.batch) % 10 == 9 or (i // a.batch) < 2):
+            for key, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+                print(f"      skipped {n:5}  {key}   e.g. {examples[key][-90:]}", flush=True)
     print(f"\ndone: {moved:,} files ({moved_bytes / 1e9:.2f} GB) sent to the Recycle Bin, {skipped} skipped, "
           f"{errors} groups no longer valid. Log: {lt.RECYCLED_LOG}")
     return 0
