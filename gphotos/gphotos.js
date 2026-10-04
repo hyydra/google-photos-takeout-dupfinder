@@ -29,6 +29,7 @@ const DONE = path.join(ROOT, 'done.txt');
 const FAILED = path.join(ROOT, 'failed.txt');
 const TMP = path.join(ROOT, 'downloads', 'tmp');
 const KEEP = path.join(ROOT, 'downloads', 'keep');
+const INGEST_DIR = path.join(ROOT, 'downloads', 'tmp', 'ingest');
 const DB = path.join(ROOT, 'gphotos.sqlite');
 const LOG = path.join(ROOT, 'run-log.tsv');
 const STALL_SHOT = path.join(ROOT, 'debug_stall.png');
@@ -38,6 +39,7 @@ const END_AFTER_FAILED_NEXT = 5;
 const REPORT_EVERY = 200;
 
 fs.mkdirSync(TMP, { recursive: true });
+fs.mkdirSync(INGEST_DIR, { recursive: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const lines = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split(/\r?\n/).filter(Boolean) : []);
@@ -108,18 +110,28 @@ async function waitForViewer(page) {
   return video ? 'video' : 'image';
 }
 
-// Wait for a finished, size-stable file in TMP.
-async function waitForFile(ms) {
-  const start = Date.now();
-  let last = -1, stable = 0;
-  while (Date.now() - start < ms) {
-    const names = fs.readdirSync(TMP);
-    const f = names.find((n) => !n.endsWith('.crdownload') && !n.endsWith('.tmp'));
-    if (f && !names.some((n) => n.endsWith('.crdownload'))) {
-      const size = fs.statSync(path.join(TMP, f)).size;
-      // Chrome renames <name>.crdownload to <name> only when the download is complete: one stable read is enough.
-      if (size > 0 && size === last && ++stable >= 1) return path.join(TMP, f);
-      if (size !== last) { last = size; stable = 0; }
+// Wait for a finished download in TMP. Chrome writes <name>.crdownload and renames it to <name> only when the
+// download is complete. Big originals (60 MB scans) take far longer than a fixed timeout, so a download that is
+// visibly progressing is waited for; we only give up if nothing starts within startMs or it stalls for idleMs.
+async function waitForFile(startMs, idleMs = 15000, maxMs = 300000) {
+  const t0 = Date.now();
+  let lastSize = -1, lastChange = Date.now(), sawPartial = false;
+  while (Date.now() - t0 < maxMs) {
+    const files = fs.readdirSync(TMP, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name);
+    const part = files.find((n) => n.endsWith('.crdownload'));
+    const finished = files.find((n) => !n.endsWith('.crdownload') && !n.endsWith('.tmp'));
+    if (finished && !part) {
+      const p = path.join(TMP, finished);
+      if (fs.statSync(p).size > 0) return p;
+    }
+    if (part) {
+      sawPartial = true;
+      let size = 0;
+      try { size = fs.statSync(path.join(TMP, part)).size; } catch (e) {}
+      if (size !== lastSize) { lastSize = size; lastChange = Date.now(); }
+      else if (Date.now() - lastChange > idleMs) return null;      // started but stalled
+    } else if (!sawPartial && Date.now() - t0 > startMs) {
+      return null;                                                  // never started
     }
     await sleep(100);
   }
@@ -128,13 +140,13 @@ async function waitForFile(ms) {
 
 // Shift+D downloads the original; fall back to the "More options" menu.
 async function downloadOriginal(page, id) {
-  for (const f of fs.readdirSync(TMP)) fs.rmSync(path.join(TMP, f), { force: true });
+  for (const e of fs.readdirSync(TMP, { withFileTypes: true })) if (e.isFile()) fs.rmSync(path.join(TMP, e.name), { force: true });
   await sleep(250); // brief settle before sending keys (was 1200 ms: most of the per-photo time)
 
   await page.keyboard.down('Shift');
   await page.keyboard.press('KeyD');
   await page.keyboard.up('Shift');
-  let file = await waitForFile(12000);
+  let file = await waitForFile(8000);
 
   if (!file) {
     await page.evaluate(() => {
@@ -146,10 +158,10 @@ async function downloadOriginal(page, id) {
       const m = [...document.querySelectorAll('[role="menuitem"]')].find((e) => /download/i.test(e.textContent));
       if (m) m.click();
     });
-    file = await waitForFile(15000);
+    file = await waitForFile(10000);
   }
-  if (!file) throw new Error('download did not start');
-  const target = path.join(TMP, `${id}_${path.basename(file)}`);
+  if (!file) throw new Error('download did not start or stalled');
+  const target = path.join(INGEST_DIR, `${id}_${path.basename(file)}`);
   fs.renameSync(file, target);
   return target;
 }
@@ -260,7 +272,7 @@ async function run() {
 
   // Resume: jump straight to the last photo that was finished instead of replaying the whole library with the
   // arrow key (that took minutes at 2,000 photos and would take hours at 100,000). --from-start replays it.
-  const resumeId = lines(DONE).pop();
+  const resumeId = flagVal('--resume-from') || lines(DONE).pop();   // --resume-from <photo id>: start the walk there
   if (resumeId && !process.argv.includes('--from-start') && sweep.size === 0) {
     try {
       await page.goto(`https://photos.google.com/photo/${resumeId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -275,7 +287,94 @@ async function run() {
 
   let count = 0, videos = 0, failedNext = 0, fastForwarded = 0, swept = 0;
 
-  while (count < limit && failedNext < END_AFTER_FAILED_NEXT) {
+  // Pipeline: while photo N is hashed and matched (python, ~0.5 s) the browser already downloads photo N+1.
+  // Photo N+1's ingest only starts after N's has finished (settle), so verdict order and statusById stay exact.
+  let pending = null;              // ingest + bookkeeping of the previously downloaded photo, running in the background
+  const trashQueue = [];           // auto-trash must happen with the browser on that photo: done at a safe moment
+  const maxMs = (Number(flagVal('--max-seconds')) || 0) * 1000;   // chunked runs: stop cleanly after this long
+  const tStart = Date.now();
+
+  const recordFailure = async (id, e) => {
+    fs.appendFileSync(DONE, id + '\n');
+    done.add(id);
+    if (e instanceof VideoSkip) {
+      videos++;
+      log(`skip ${id.slice(0, 12)}… video/non-image (${videos} skipped)`);
+    } else {
+      fs.appendFileSync(FAILED, `${id}\t${e.message.replace(/\s+/g, ' ')}\n`);
+      log(`FAILED ${id.slice(0, 12)}…: ${e.message}`);
+      await page.screenshot({ path: STALL_SHOT }).catch(() => {});
+    }
+  };
+
+  // Ingest one downloaded original and record its verdict. Runs while the next photo is being downloaded.
+  const finishPhoto = async (id, file, t) => {
+    try {
+      let target = file;
+      if (keep) {
+        fs.mkdirSync(KEEP, { recursive: true });
+        target = path.join(KEEP, path.basename(file));
+        fs.copyFileSync(file, target);
+      }
+      const v = await ingest(id, target, takeout, keep);
+      const t3 = Date.now();
+      if (keep && fs.existsSync(file)) fs.rmSync(file, { force: true });
+      if (!v.w || !v.h) throw new VideoSkip(); // not a readable image
+
+      // WOULD_TRASH = byte-identical to another photo; PROBABLE_REVIEW = same pixels / near-identical /
+      // same EXIF but different bytes (never auto-trashed, only logged for review in the dashboard).
+      let action = 'KEEP';
+      if (v.gp_dup_of || v.local_dup) action = 'WOULD_TRASH';
+      else if (v.probable) action = 'PROBABLE_REVIEW';
+
+      // Auto-trash: only a byte-identical copy (SHA-256 + size + CRC32) of an online photo that was kept.
+      const wantTrash = autoTrash && action === 'WOULD_TRASH' && v.gp_dup_of && v.sha && v.size > 0 && v.crc_confirmed
+        && statusById.get(v.gp_dup_of) === 'KEEP';
+      statusById.set(id, action);
+
+      fs.appendFileSync(LOG, [id, action, v.sha, v.size, `${v.w}x${v.h}`, v.dt, v.make, v.model,
+        v.gp_dup_of || '', v.local_dup || '', v.probable || '', v.reason || '', v.crc || ''].join('\t') + '\n');
+      fs.appendFileSync(DONE, id + '\n');
+      done.add(id);
+      count++;
+      log(`#${count} ${id.slice(0, 12)}… ${action}${v.reason ? ' (' + v.reason + ')' : ''} ${v.w}x${v.h}  [view ${t.t1 - t.t0}ms, download ${t.t2 - t.t1}ms, ingest ${t3 - t.t2}ms]`);
+      if (wantTrash) trashQueue.push(id);
+    } catch (e) {
+      await recordFailure(id, e);
+    }
+  };
+
+  const settle = async () => {
+    if (pending) { const p = pending; pending = null; await p; }
+  };
+
+  // Trash queued duplicates (the result is recorded in trashed.txt, which the dashboard overlays as TRASH),
+  // then return the browser to the photo it was on.
+  const flushTrash = async (backToId) => {
+    while (trashQueue.length) {
+      const tid = trashQueue.shift();
+      try {
+        await page.goto(`https://photos.google.com/photo/${tid}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await waitForViewer(page);
+        await sleep(800);
+        if (idFromUrl(page.url()) === tid && (await trashCurrent(page))) {
+          fs.appendFileSync(TRASHED, tid + '\n');
+          alreadyTrashed.add(tid);
+          log(`auto-trashed ${tid.slice(0, 12)}… (SHA-256 + CRC32 identical to a kept online photo) -> Google Photos trash`);
+        } else {
+          log(`auto-trash did not complete for ${tid.slice(0, 12)}…`);
+        }
+      } catch (e) {
+        log(`auto-trash skipped ${tid.slice(0, 12)}…: ${e.message}`);
+      }
+    }
+    if (backToId) {
+      await page.goto(`https://photos.google.com/photo/${backToId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await waitForViewer(page).catch(() => {});
+    }
+  };
+
+  while (count < limit && failedNext < END_AFTER_FAILED_NEXT && (!maxMs || Date.now() - tStart < maxMs)) {
     const id = idFromUrl(page.url());
     if (!id) { await sleep(500); failedNext++; continue; }
 
@@ -298,57 +397,18 @@ async function run() {
       } else if (++fastForwarded % 50 === 0) log(`fast-forwarded ${fastForwarded} already-done photos`);
     } else {
       try {
-        trashed = await withTimeout((async () => {
-          const T0 = Date.now();
+        await withTimeout((async () => {
+          const t0 = Date.now();
           if ((await waitForViewer(page)) === 'video') throw new VideoSkip();
-          const T1 = Date.now();
+          const t1 = Date.now();
           const file = await downloadOriginal(page, id);
-          const T2 = Date.now();
-          let target = file;
-          if (keep) {
-            fs.mkdirSync(KEEP, { recursive: true });
-            target = path.join(KEEP, path.basename(file));
-            fs.copyFileSync(file, target);
-          }
-          const v = await ingest(id, target, takeout, keep);
-          const T3 = Date.now();
-          if (keep && fs.existsSync(file)) fs.rmSync(file, { force: true });
-          if (!v.w || !v.h) throw new VideoSkip(); // not a readable image
-
-          // WOULD_TRASH = byte-identical to another photo; PROBABLE_REVIEW = same pixels / near-identical /
-          // same EXIF but different bytes (never auto-trashed, only logged for review in the dashboard).
-          let action = 'KEEP';
-          if (v.gp_dup_of || v.local_dup) action = 'WOULD_TRASH';
-          else if (v.probable) action = 'PROBABLE_REVIEW';
-
-          // Auto-trash: only a byte-identical (SHA-256 + size) copy of an online photo that was kept.
-          let didTrash = false;
-          if (autoTrash && action === 'WOULD_TRASH' && v.gp_dup_of && v.sha && v.size > 0 && v.crc_confirmed
-              && statusById.get(v.gp_dup_of) === 'KEEP') {
-            didTrash = await trashCurrent(page);
-            if (didTrash) action = 'TRASH';
-          }
-          statusById.set(id, action);
-
-          fs.appendFileSync(LOG, [id, action, v.sha, v.size, `${v.w}x${v.h}`, v.dt, v.make, v.model,
-            v.gp_dup_of || '', v.local_dup || '', v.probable || '', v.reason || '', v.crc || ''].join('\t') + '\n');
-          fs.appendFileSync(DONE, id + '\n');
-          done.add(id);
-          count++;
-          log(`#${count} ${id.slice(0, 12)}… ${action}${v.reason ? ' (' + v.reason + ')' : ''} ${v.w}x${v.h}  [view ${T1 - T0}ms, download ${T2 - T1}ms, ingest ${T3 - T2}ms]`);
-          return didTrash;
+          const t2 = Date.now();
+          await settle();                                   // previous photo's ingest + log must finish first
+          if (trashQueue.length) await flushTrash(id);      // rare: auto-trash of a previous duplicate, then come back
+          pending = finishPhoto(id, file, { t0, t1, t2 });  // not awaited: overlaps with the next photo's download
         })(), PHOTO_DEADLINE_MS, `photo ${id}`);
       } catch (e) {
-        fs.appendFileSync(DONE, id + '\n');
-        done.add(id);
-        if (e instanceof VideoSkip) {
-          videos++;
-          log(`skip ${id.slice(0, 12)}… video/non-image (${videos} skipped)`);
-        } else {
-          fs.appendFileSync(FAILED, `${id}\t${e.message.replace(/\s+/g, ' ')}\n`);
-          log(`FAILED ${id.slice(0, 12)}…: ${e.message}`);
-          await page.screenshot({ path: STALL_SHOT }).catch(() => {});
-        }
+        await recordFailure(id, e);
       }
       if (count > 0 && count % REPORT_EVERY === 0) await rebuildReport();
     }
@@ -359,6 +419,8 @@ async function run() {
     if (!moved) log(`could not advance from ${id.slice(0, 12)}… (${failedNext}/${END_AFTER_FAILED_NEXT})`);
   }
 
+  await settle();
+  if (trashQueue.length) await flushTrash(null);
   log(`finished: ${count} processed, ${videos} videos skipped, ${fastForwarded} fast-forwarded`);
   await rebuildReport();
   browser.removeAllListeners('disconnected');
