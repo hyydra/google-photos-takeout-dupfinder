@@ -13,7 +13,7 @@ So before and during a run this module
   * saves a preview of each file before it goes, and logs every file to recycled-log.tsv.
 Everything sent here can be restored from the Recycle Bin.
 """
-import ctypes, hashlib, os, re, sqlite3, sys, time, winreg
+import ctypes, hashlib, os, re, sqlite3, sys, time, winreg, zlib
 from ctypes import wintypes
 from pathlib import Path
 
@@ -155,8 +155,17 @@ def file_sha256(path):
     return h.hexdigest()
 
 
+def file_crc32(path):
+    """CRC32 of the file bytes (8 hex digits): a second, independent checksum next to SHA-256."""
+    crc = 0
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            crc = zlib.crc32(chunk, crc)
+    return f"{crc & 0xFFFFFFFF:08x}"
+
+
 def still_matches(path, sha, verify, size, mtime):
-    if verify == "stat":      # cheap check for batch runs: untouched since the index was built
+    if "stat" in verify:      # 'stat' / 'stat+crc': untouched since the index was built (size + mtime)
         st = os.stat(path)
         return st.st_size == size and abs(st.st_mtime - mtime) < 2
     return file_sha256(path) == sha
@@ -247,6 +256,7 @@ def _plan_group(ro, sha, verify, removed=frozenset()):
     keeper = rows[0]
     if not os.path.exists(keeper[0]) or not still_matches(keeper[0], sha, verify, keeper[1], keeper[2]):
         raise ValueError("the copy to keep is missing or changed on disk; nothing was removed")
+    keeper_crc = file_crc32(keeper[0]) if "crc" in verify else ""   # every duplicate must match this CRC32 too
     ok, skipped = [], []
     for src, size, mtime in rows[1:]:
         try:
@@ -256,8 +266,10 @@ def _plan_group(ro, sha, verify, removed=frozenset()):
                 skipped.append([src, "missing"])
             elif not still_matches(src, sha, verify, size, mtime):
                 skipped.append([src, "content no longer matches the index"])
+            elif keeper_crc and (crc := file_crc32(src)) != keeper_crc:
+                skipped.append([src, f"CRC32 {crc} differs from the kept copy {keeper_crc} (left in place)"])
             else:
-                ok.append((src, size))
+                ok.append((src, size, keeper_crc))
         except Exception as e:
             skipped.append([src, str(e)])
     return keeper[0], ok, skipped
@@ -269,7 +281,7 @@ def trash_groups(takeout_db, shas, verify="hash", budgets=None, chunk=300):
     Raises BinBreaker (and stops) if the Recycle Bin ever fails to receive what was removed."""
     ro = sqlite3.connect(f"file:{takeout_db}?mode=ro", uri=True, timeout=60)
     budgets = budgets if budgets is not None else {}
-    work, skipped, errors = [], [], []          # work: (src, size, sha, keeper)
+    work, skipped, errors = [], [], []          # work: (src, size, sha, keeper, crc)
     removed = _removed_paths() | logged_paths()
     for sha in shas:
         try:
@@ -278,7 +290,7 @@ def trash_groups(takeout_db, shas, verify="hash", budgets=None, chunk=300):
             errors.append([sha, str(e)])
             continue
         skipped += sk
-        work += [(src, size, sha, keeper) for src, size in ok]
+        work += [(src, size, sha, keeper, crc) for src, size, crc in ok]
     ro.close()
 
     moved, total = [], 0
@@ -298,10 +310,10 @@ def trash_groups(takeout_db, shas, verify="hash", budgets=None, chunk=300):
                              f"entr{'y' if gained == 1 else 'ies'}: stopped, check the drive")
         now = time.strftime("%F %T")
         with open(RECYCLED_LOG, "a", encoding="utf-8") as lf:
-            for src, size, sha, keeper in gone:
-                lf.write("\t".join([now, sha, src, keeper, str(size)]) + "\n")
+            for src, size, sha, keeper, crc in gone:
+                lf.write("\t".join([now, sha, src, keeper, str(size), crc]) + "\n")
         db_delete(takeout_db, [b[0] for b in gone])
-        for src, size, sha, keeper in batch:
+        for src, size, sha, keeper, crc in batch:
             if os.path.exists(src):
                 skipped.append([src, "could not be sent to the Recycle Bin (left in place)"])
             else:

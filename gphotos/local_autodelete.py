@@ -24,6 +24,9 @@ def main():
     ap.add_argument("--go", action="store_true", help="really send files to the Recycle Bin (default: dry run)")
     ap.add_argument("--max-groups", type=int, default=0, help="stop after this many groups (pilot run)")
     ap.add_argument("--batch", type=int, default=100, help="groups per Recycle Bin batch")
+    ap.add_argument("--verify", default="stat+crc", choices=["stat", "stat+crc", "hash"],
+                    help="check before a file is touched: stat+crc (default) = size/mtime match the index AND its "
+                         "CRC32 equals the kept copy's; stat = size/mtime only; hash = full SHA-256")
     a = ap.parse_args()
 
     if a.go:
@@ -52,7 +55,7 @@ def main():
     for i in range(0, len(groups), a.batch):
         shas = [g[0] for g in groups[i:i + a.batch]]
         try:
-            r = lt.trash_groups(a.takeout, shas, verify="stat", budgets=budgets)
+            r = lt.trash_groups(a.takeout, shas, verify=a.verify, budgets=budgets)
         except lt.BinBreaker as e:
             print(f"\nSTOPPED by a Recycle Bin safety check: {e}")
             print(f"so far: {moved:,} files / {moved_bytes / 1e9:.2f} GB moved. Nothing further was touched.")
