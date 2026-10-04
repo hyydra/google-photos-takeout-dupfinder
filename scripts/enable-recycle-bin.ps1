@@ -21,7 +21,11 @@
   With -Apply: set each drive's bin capacity to this many GB (never shrinks an existing larger capacity).
   Omit to leave capacities alone and only make sure the bin is enabled.
 
+.PARAMETER Drive
+  Limit to these drive letters, e.g. -Drive K  or  -Drive K,L. Default: every fixed drive.
+
 .EXAMPLE
+  .\enable-recycle-bin.ps1 -Apply -Drive K -MaxCapacityGB 450   # only K:
   .\enable-recycle-bin.ps1                       # report only
   .\enable-recycle-bin.ps1 -Apply                # enable the bin on every fixed drive
   .\enable-recycle-bin.ps1 -Apply -MaxCapacityGB 400
@@ -29,7 +33,8 @@
 [CmdletBinding()]
 param(
     [switch]$Apply,
-    [int]$MaxCapacityGB = 0
+    [int]$MaxCapacityGB = 0,
+    [string[]]$Drive = @()      # e.g. -Drive K  (default: every fixed drive)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,7 +55,9 @@ function Get-BinUsedBytes([string]$root) {
 }
 
 $changed = 0
-$volumes = Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 3 } | Sort-Object DriveLetter
+$letters = @($Drive | ForEach-Object { ($_ -replace '[:\\]', '').ToUpper() })
+$volumes = Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 3 } |
+    Where-Object { $letters.Count -eq 0 -or $letters -contains $_.DriveLetter.TrimEnd(':').ToUpper() } | Sort-Object DriveLetter
 foreach ($v in $volumes) {
     $guid = ($v.DeviceID -replace '^\\\\\?\\Volume', '' -replace '\\$', '')      # {xxxxxxxx-...}
     $key = Join-Path $base $guid
