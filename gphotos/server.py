@@ -11,14 +11,66 @@ Serves:
 Usage:
   python server.py [--port 8765]
 """
-import argparse, http.server, io, json, os, re, socketserver, sys, threading, urllib.parse
+import argparse, hashlib, http.server, io, json, os, re, socketserver, sqlite3, sys, threading, time, urllib.parse
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageOps
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
 
 ROOT = Path(__file__).resolve().parent
 LOG_FILE = ROOT / "run-log.tsv"
 THUMB_DIR = ROOT / "thumbnails"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+TAKEOUT_DB = Path(os.environ.get("TAKEOUT_DB") or ROOT.parent / "takeout.sqlite")  # local Takeout index (dupfinder.py)
+_local_cache = {}
+
+def takeout_conn():
+    if not TAKEOUT_DB.exists():
+        return None
+    return sqlite3.connect(f"file:{TAKEOUT_DB}?mode=ro", uri=True, timeout=30)
+
+def local_groups(kind, offset, limit):
+    """Duplicate groups among the local Takeout files: 'exact' (same SHA-256) or 'pixel' (same decoded pixels)."""
+    db = takeout_conn()
+    empty = {"files_total": 0, "files_hashed": 0, "total": 0, "reclaim_bytes": 0, "groups": []}
+    if not db:
+        return empty
+    key, having = ("sha", "COUNT(*) > 1") if kind == "exact" else ("pix", "COUNT(DISTINCT sha) > 1")
+    cached = _local_cache.get(kind)
+    if not cached or time.time() - cached[0] > 120:
+        rows = db.execute(f"SELECT {key}, COUNT(*), SUM(size) FROM f WHERE {key} IS NOT NULL AND {key} <> '' "
+                          f"GROUP BY {key} HAVING {having} ORDER BY COUNT(*) DESC, SUM(size) DESC").fetchall()
+        files_total = db.execute("SELECT COUNT(*) FROM f").fetchone()[0]
+        hashed = db.execute("SELECT COUNT(*) FROM f WHERE pix IS NOT NULL").fetchone()[0]
+        reclaim = int(sum(total - total / n for _, n, total in rows)) if kind == "exact" else 0
+        cached = _local_cache[kind] = (time.time(), rows, files_total, hashed, reclaim)
+    _, rows, files_total, hashed, reclaim = cached
+    cols = ("path", "size", "w", "h", "dt", "make", "model", "mtime")
+    groups = []
+    for k, n, total in rows[offset:offset + limit]:
+        files = db.execute(f"SELECT {','.join(cols)} FROM f WHERE {key}=? ORDER BY mtime, LENGTH(path)", (k,)).fetchall()
+        groups.append({"key": k, "count": n, "bytes": total, "files": [dict(zip(cols, r)) for r in files]})
+    return {"files_total": files_total, "files_hashed": hashed, "total": len(rows), "reclaim_bytes": reclaim, "groups": groups}
+
+def local_thumb(path):
+    """Thumbnail for a local Takeout file; only files listed in the Takeout index are served."""
+    db = takeout_conn()
+    if not db or not db.execute("SELECT 1 FROM f WHERE path=?", (path,)).fetchone():
+        return None
+    out = THUMB_DIR / ("lt_" + hashlib.sha1(path.encode("utf-8", "surrogatepass")).hexdigest()[:20] + ".jpg")
+    if not out.exists():
+        try:
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)
+                im.thumbnail((360, 360))
+                im.convert("RGB").save(out, "JPEG", quality=80)
+        except Exception:
+            return None
+    return out
 
 MARKS_FILE = ROOT / "marked.txt"   # photo ids the user marked for deletion in the dashboard
 MARKS_LOCK = threading.Lock()
@@ -149,6 +201,29 @@ class LiveHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(content)
             except Exception as e:
                 self.send_error(500, str(e))
+            return
+        elif parsed.path == '/api/local':
+            q = urllib.parse.parse_qs(parsed.query)
+            kind = 'pixel' if q.get('kind', ['exact'])[0] == 'pixel' else 'exact'
+            try:
+                offset = max(0, int(q.get('offset', ['0'])[0]))
+                limit = min(50, max(1, int(q.get('limit', ['10'])[0])))
+                self.send_json(local_groups(kind, offset, limit))
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+        elif parsed.path == '/local-thumb':
+            thumb = local_thumb(urllib.parse.parse_qs(parsed.query).get('path', [''])[0])
+            if not thumb:
+                self.send_error(404)
+                return
+            data = thumb.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'max-age=86400')
+            self.end_headers()
+            self.wfile.write(data)
             return
         elif parsed.path == '/api/marks':
             self.send_json({"ids": sorted(read_marks())})

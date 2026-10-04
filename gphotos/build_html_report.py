@@ -542,6 +542,7 @@ def generate_report(log_path, out_path, thumb_dir):
       <button class="tab-btn {grp_active}" onclick="switchView('groups', this)">Duplicate Groups <span class="tab-count">{len(dup_groups)}</span></button>
       <button class="tab-btn" onclick="switchView('groups', this, 'exact')">Exact <span class="tab-count">{n_exact}</span></button>
       <button class="tab-btn" onclick="switchView('groups', this, 'suspicious')">Suspicious <span class="tab-count">{n_susp}</span></button>
+      <button class="tab-btn" onclick="showLocal(this)">Local Takeout <span class="tab-count" id="localCount">&hellip;</span></button>
       <button class="tab-btn {all_active}" onclick="switchView('all', this)">All Items Grid <span class="tab-count">{total_scanned}</span></button>
       <button class="tab-btn" onclick="filterStandard('trash', this)">Deleted <span class="tab-count">{trashed_count}</span></button>
       <button class="tab-btn" onclick="filterStandard('would', this)">Would Trash <span class="tab-count">{would_trash_count}</span></button>
@@ -671,6 +672,17 @@ def generate_report(log_path, out_path, thumb_dir):
     html_content += """
   </div>
 
+  <!-- LOCAL TAKEOUT VIEW (loaded on demand from /api/local) -->
+  <div id="localView" style="display: none;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px;">
+      <button class="tab-btn active" id="localKindExact" onclick="setLocalKind('exact')">Exact (same SHA-256)</button>
+      <button class="tab-btn" id="localKindPixel" onclick="setLocalKind('pixel')">Same pixels, different file</button>
+      <span id="localStats" style="color:var(--text-secondary); font-size:13px;"></span>
+    </div>
+    <div id="localGroups"></div>
+    <div style="text-align:center; margin:18px 0;"><button class="tab-btn" id="localMore" onclick="loadLocal(false)" style="display:none;">Load more groups</button></div>
+  </div>
+
   <!-- VIEW 2: FLAT ALL ITEMS GRID -->
   <div id="standardGrid" class="photo-grid" style="display: {all_disp};">"""
 
@@ -749,6 +761,7 @@ window.addEventListener('beforeunload', () => {
 });
 
 function switchView(view, btn, kind) {
+  if (view === 'local') { showLocal(btn); return; }
   groupKind = kind || 'all';
   currentView = view;
   sessionStorage.setItem('gp_view', view);
@@ -757,6 +770,7 @@ function switchView(view, btn, kind) {
 
   const groupsView = document.getElementById('duplicateGroupsView');
   const gridView = document.getElementById('standardGrid');
+  document.getElementById('localView').style.display = 'none';
 
   if (view === 'groups') {
     groupsView.style.display = 'block';
@@ -777,6 +791,7 @@ function filterStandard(filter, btn) {
   if (btn) btn.classList.add('active');
 
   document.getElementById('duplicateGroupsView').style.display = 'none';
+  document.getElementById('localView').style.display = 'none';
   document.getElementById('standardGrid').style.display = 'grid';
   standardFilter = filter.toLowerCase();
   filterCards();
@@ -839,7 +854,7 @@ async function checkUpdates() {
       if (res.ok) {
         const data = await res.json();
         const currentCount = parseInt(document.querySelector('.metric-val').innerText, 10) || 0;
-        if (data.stats.total !== currentCount) {
+        if (data.stats.total !== currentCount && currentView !== 'local') {
           sessionStorage.setItem('gp_scroll', window.scrollY);
           sessionStorage.setItem('gp_search', document.getElementById('searchBox').value);
           sessionStorage.setItem('gp_view', currentView);
@@ -897,6 +912,80 @@ async function loadMarks() {
   syncMarks();
 }
 window.addEventListener('DOMContentLoaded', loadMarks);
+
+// ---- Local Takeout view -------------------------------------------------
+let localKind = 'exact', localOffset = 0, localTotal = 0, localBusy = false;
+const LOCAL_PAGE = 10;
+const CROSS = '<div class="cross-overlay"><svg viewBox="0 0 100 100" preserveAspectRatio="none"><line x1="0" y1="0" x2="100" y2="100" stroke="#f43f5e" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linecap="round"/><line x1="100" y1="0" x2="0" y2="100" stroke="#f43f5e" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linecap="round"/></svg></div>';
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function showLocal(btn) {
+  currentView = 'local';
+  sessionStorage.setItem('gp_view', 'local');
+  document.querySelectorAll('.tab-btn').forEach(b => { if (b.id !== 'localKindExact' && b.id !== 'localKindPixel' && b.id !== 'localMore') b.classList.remove('active'); });
+  if (btn) btn.classList.add('active');
+  document.getElementById('duplicateGroupsView').style.display = 'none';
+  document.getElementById('standardGrid').style.display = 'none';
+  document.getElementById('localView').style.display = 'block';
+  if (!document.getElementById('localGroups').children.length) loadLocal(true);
+}
+function setLocalKind(kind) {
+  localKind = kind;
+  document.getElementById('localKindExact').classList.toggle('active', kind === 'exact');
+  document.getElementById('localKindPixel').classList.toggle('active', kind === 'pixel');
+  loadLocal(true);
+}
+function imgFail(img) {
+  const d = document.createElement('div');
+  d.className = 'thumb-placeholder';
+  d.innerHTML = '<span>&#128247;</span><span>No preview</span>';
+  img.replaceWith(d);
+}
+function localCard(f, keeper) {
+  const name = f.path.split(String.fromCharCode(92)).pop().split('/').pop();
+  const thumb = '/local-thumb?path=' + encodeURIComponent(f.path);
+  const dims = (f.w && f.h) ? f.w + 'x' + f.h : 'N/A';
+  return '<div class="card ' + (keeper ? 'card-keeper' : 'card-duplicate') + '"><div class="thumb-wrap">'
+    + '<img loading="lazy" src="' + thumb + '" onerror="imgFail(this)">'
+    + (keeper ? '' : CROSS)
+    + '<span class="badge ' + (keeper ? 'badge-keeper' : 'badge-duplicate') + '">' + (keeper ? '&#10004; KEEP (OLDEST)' : '&#10006; DUPLICATE') + '</span></div>'
+    + '<div class="card-body"><div class="meta-row"><span class="meta-pill">' + dims + '</span><span class="meta-pill">' + fmtBytes(f.size || 0) + '</span></div>'
+    + '<div class="camera-row" title="' + esc(f.path) + '">&#128190; ' + esc(name) + '</div>'
+    + '<div class="date-row">' + esc(f.dt || 'No EXIF Date') + '</div>'
+    + '<div class="date-row" title="' + esc(f.path) + '" style="font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(f.path) + '</div></div></div>';
+}
+async function loadLocal(reset) {
+  if (localBusy) return;
+  localBusy = true;
+  const box = document.getElementById('localGroups'), more = document.getElementById('localMore'), stats = document.getElementById('localStats');
+  if (reset) { localOffset = 0; box.innerHTML = ''; stats.textContent = 'Loading...'; }
+  try {
+    const r = await fetch('/api/local?kind=' + localKind + '&offset=' + localOffset + '&limit=' + LOCAL_PAGE, { cache: 'no-store' });
+    const d = await r.json();
+    localTotal = d.total || 0;
+    document.getElementById('localCount').textContent = localTotal;
+    stats.textContent = (d.files_total || 0).toLocaleString() + ' local files indexed (' + (d.files_hashed || 0).toLocaleString() + ' content-hashed) · '
+      + localTotal.toLocaleString() + ' ' + (localKind === 'exact' ? 'exact' : 'same-pixel') + ' groups'
+      + (localKind === 'exact' ? ' · ' + fmtBytes(d.reclaim_bytes || 0) + ' reclaimable' : '');
+    if (!localTotal && reset) box.innerHTML = '<div style="text-align:center; padding:50px; color:var(--text-muted);">No ' + (localKind === 'exact' ? 'exact' : 'same-pixel') + ' groups found yet.' + (localKind === 'pixel' ? ' Pixel hashes are still being computed for the local archive.' : '') + '</div>';
+    (d.groups || []).forEach((g, i) => {
+      const num = localOffset + i + 1;
+      const files = g.files || [];
+      box.insertAdjacentHTML('beforeend',
+        '<div class="dup-group ' + (localKind === 'exact' ? 'exact' : 'suspicious') + '">'
+        + '<div class="dup-group-header"><div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;"><span class="group-badge-title">LOCAL GROUP #' + num + '</span>'
+        + '<span class="sha-tag">' + (localKind === 'exact' ? 'SHA-256: ' : 'pixels: ') + esc(String(g.key).slice(0, 16)) + '...</span></div>'
+        + '<div class="group-meta"><span>' + g.count + ' files</span> &bull; <span class="reclaim-pill">' + fmtBytes(g.bytes || 0) + ' total</span></div></div>'
+        + '<div class="group-cards-row">' + files.map((f, j) => localCard(f, j === 0)).join('') + '</div></div>');
+    });
+    localOffset += (d.groups || []).length;
+    more.style.display = localOffset < localTotal ? 'inline-block' : 'none';
+  } catch (e) {
+    stats.textContent = 'Could not load local Takeout data: ' + e;
+  }
+  localBusy = false;
+}
+window.addEventListener('DOMContentLoaded', () => { fetch('/api/local?kind=exact&offset=0&limit=1').then(r => r.json()).then(d => { document.getElementById('localCount').textContent = d.total || 0; }).catch(() => {}); });
 </script>
 </body>
 </html>"""
