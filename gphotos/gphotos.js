@@ -294,12 +294,13 @@ async function run() {
   const maxMs = (Number(flagVal('--max-seconds')) || 0) * 1000;   // chunked runs: stop cleanly after this long
   const tStart = Date.now();
 
+  let photoT0 = Date.now();        // start of the current photo's turn, for the timing in skip/slow-step log lines
   const recordFailure = async (id, e) => {
     fs.appendFileSync(DONE, id + '\n');
     done.add(id);
     if (e instanceof VideoSkip) {
       videos++;
-      log(`skip ${id.slice(0, 12)}… video/non-image (${videos} skipped)`);
+      log(`skip ${id.slice(0, 12)}… video/non-image (${videos} skipped) [${Date.now() - photoT0}ms]`);
     } else {
       fs.appendFileSync(FAILED, `${id}\t${e.message.replace(/\s+/g, ' ')}\n`);
       log(`FAILED ${id.slice(0, 12)}…: ${e.message}`);
@@ -376,6 +377,7 @@ async function run() {
 
   while (count < limit && failedNext < END_AFTER_FAILED_NEXT && (!maxMs || Date.now() - tStart < maxMs)) {
     const id = idFromUrl(page.url());
+    photoT0 = Date.now();
     if (!id) { await sleep(500); failedNext++; continue; }
 
     let trashed = false;
@@ -414,7 +416,9 @@ async function run() {
     }
 
     if (trashed) await sleep(1000); // after a trash Google Photos moves to the next photo by itself
+    const tNext = Date.now();
     const moved = trashed && idFromUrl(page.url()) !== id ? true : await goNext(page, id);
+    if (Date.now() - tNext > 3000) log(`slow step: moving to the next photo took ${Date.now() - tNext}ms`);
     failedNext = moved ? 0 : failedNext + 1;
     if (!moved) log(`could not advance from ${id.slice(0, 12)}… (${failedNext}/${END_AFTER_FAILED_NEXT})`);
   }
