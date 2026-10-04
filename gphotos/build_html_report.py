@@ -171,14 +171,23 @@ def generate_report(log_path, out_path, thumb_dir):
     n_exact = sum(1 for g in dup_groups if g['kind'] == 'exact')
     n_susp = len(dup_groups) - n_exact
 
+    def removable_online(it):
+        """True only when ANOTHER online photo stays behind: an online photo that merely matches a local file is
+        the only online version and must never be offered for deletion."""
+        if it['action'] == 'WOULD_TRASH':
+            return bool(it.get('gp_dup_of'))
+        if it['action'] == 'PROBABLE_REVIEW':
+            return str(it.get('probable', '')).startswith('AF1Q')
+        return False
+
     def mark_box(it):
-        if it['action'] not in ('WOULD_TRASH', 'PROBABLE_REVIEW'):
+        if not removable_online(it):
             return ''
         return (f'<label class="mark-box"><input type="checkbox" class="mark-cb" data-id="{html.escape(it["id"])}" '
                 f'data-size="{it["size"]}" onchange="toggleMark(this)"> Mark for deletion</label>')
 
     def del_button(g):
-        eligible = [d for d in g['duplicates'] if d['action'] in ('WOULD_TRASH', 'PROBABLE_REVIEW')]
+        eligible = [d for d in g['duplicates'] if removable_online(d)]
         if not eligible:
             return ''
         ids = ','.join(html.escape(d['id']) for d in eligible)

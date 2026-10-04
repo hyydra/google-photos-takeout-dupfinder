@@ -350,8 +350,15 @@ async function trashMarked() {
   const allMarks = lines(path.join(ROOT, 'marked.txt'));
   const onlyIds = flagVal('--ids'); // dashboard group button: trash exactly these ids
   const marked = onlyIds ? onlyIds.split(',').filter(Boolean) : allMarks;
-  const status = new Map(lines(LOG).map((l) => l.split('\t')).map((c) => [c[0], c[1]]));
-  const eligible = marked.filter((id) => ['WOULD_TRASH', 'PROBABLE_REVIEW'].includes(status.get(id)));
+  const rowsById = new Map(lines(LOG).map((l) => l.split('\t')).map((c) => [c[0], c]));
+  // Removable only if ANOTHER online photo stays behind (still logged KEEP): one online + one offline copy always remain.
+  const removable = (id) => {
+    const c = rowsById.get(id);
+    if (!c) return false;
+    const ref = c[1] === 'WOULD_TRASH' ? c[8] : (c[1] === 'PROBABLE_REVIEW' && /^AF1Q/.test(c[10] || '') ? c[10] : '');
+    return !!ref && ref !== id && (rowsById.get(ref) || [])[1] === 'KEEP';
+  };
+  const eligible = marked.filter(removable);
   console.log(`${marked.length} marked in the dashboard, ${eligible.length} eligible `
     + `(${marked.length - eligible.length} not in the scan log as a duplicate/suspect, or already trashed)`);
   if (eligible.length === 0) return;

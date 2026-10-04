@@ -111,15 +111,25 @@ def delete_online(ids):
     """Queue photos for the Google Photos trash (marked.txt). If no scan is running, start the confirm-gated
     trash step for exactly these ids right away; otherwise they wait for the next `gphotos.js trash`."""
     ids = [i for i in ids if isinstance(i, str) and ID_RE.match(i)]
-    status = {}
+    rows = {}
     if LOG_FILE.exists():
         for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
             c = line.split("\t")
             if len(c) > 1:
-                status[c[0]] = c[1]
-    eligible = [i for i in ids if status.get(i) in ("WOULD_TRASH", "PROBABLE_REVIEW")]
+                rows[c[0]] = c
+
+    def removable(i):
+        """Only if ANOTHER online photo stays behind (still logged as KEEP). A photo that merely matches a local
+        Takeout file is the only online version: one online and one offline copy always stay as the backup pair."""
+        c = rows.get(i)
+        if not c or len(c) < 11:
+            return False
+        ref = c[8] if c[1] == "WOULD_TRASH" else (c[10] if c[1] == "PROBABLE_REVIEW" and c[10].startswith("AF1Q") else "")
+        return bool(ref) and ref != i and rows.get(ref, ["", ""])[1] == "KEEP"
+
+    eligible = [i for i in ids if removable(i)]
     if not eligible:
-        raise ValueError("none of these photos is a logged duplicate or suspect")
+        raise ValueError("none of these photos can be removed: each is the only online copy (or has no kept online original)")
     with MARKS_LOCK:
         write_marks(read_marks() | set(eligible))
     if scan_running():
