@@ -421,6 +421,28 @@ async function run() {
 
   await settle();
   if (trashQueue.length) await flushTrash(null);
+
+  // Retry photos whose download failed (network hiccup, huge file): once per photo, at the end of the chunk.
+  const RETRIED = path.join(ROOT, 'failed-retried.txt');
+  const retried = new Set(lines(RETRIED));
+  const retryIds = [...new Set(lines(FAILED).map((l) => l.split('\t'))
+    .filter((c) => /download did not start|stalled|timeout|navigation|EPERM|EBUSY|ENOENT|ingest failed/i.test(c[1] || '') && !/trash/.test(c[1] || ''))
+    .map((c) => c[0]))].filter((rid) => !statusById.has(rid) && !retried.has(rid));
+  for (const rid of retryIds.slice(0, 40)) {
+    fs.appendFileSync(RETRIED, rid + '\n');
+    try {
+      await page.goto(`https://photos.google.com/photo/${rid}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      if ((await waitForViewer(page)) === 'video') throw new VideoSkip();
+      const t1 = Date.now();
+      const file = await downloadOriginal(page, rid);
+      await settle();
+      pending = finishPhoto(rid, file, { t0: t1, t1, t2: Date.now() });
+      await settle();
+      log(`retry ${rid.slice(0, 12)}… ${statusById.has(rid) ? 'recovered' : 'still failing'}`);
+    } catch (e) {
+      log(`retry ${rid.slice(0, 12)}… failed again: ${e.message}`);
+    }
+  }
   log(`finished: ${count} processed, ${videos} videos skipped, ${fastForwarded} fast-forwarded`);
   await rebuildReport();
   browser.removeAllListeners('disconnected');
