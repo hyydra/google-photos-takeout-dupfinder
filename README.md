@@ -16,7 +16,7 @@ An automated, high-precision duplicate image detection, verification, and cleanu
    * EXIF extraction: `DateTimeOriginal` with subsecond precision, camera `Make`/`Model`, `ImageUniqueID`, and native dimensions ($W \times H$).
    * Clustered duplicate reporting in CSV, JSON, and HTML visual grids.
 3. **Live Google Photos Browser Automation (`gphotos/gphotos.js`)**:
-   * Playwright-driven browser automation with persistent session authentication.
+   * Puppeteer-driven browser automation (system Chrome) with persistent session authentication.
    * High-speed original file download interception and real-time EXIF/SHA-256 analysis.
    * Automated cross-referencing against both online photos and local Takeout archives.
    * Safe trashing of verified online duplicates via the native Google Photos UI.
@@ -58,7 +58,7 @@ flowchart TD
 
 ### 1. Requirements
 * Python 3.10+ (`Pillow`, `piexif`)
-* Node.js 18+ & Playwright (`npm install`)
+* Node.js 18+ & Puppeteer (`npm install`)
 * Google Chrome
 
 ### 2. Install Dependencies
@@ -69,7 +69,6 @@ pip install pillow piexif
 # In gphotos directory:
 cd gphotos
 npm install
-npx playwright install chrome
 ```
 
 ### 3. Scan Local Takeout Directory

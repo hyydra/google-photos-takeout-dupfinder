@@ -108,6 +108,7 @@ def generate_report(log_path, out_path, thumb_dir):
 
             dup_groups.append({
                 "num": group_num,
+                "kind": "exact",
                 "sha": sha,
                 "dims": g_list[0]['dims'],
                 "camera": g_list[0]['camera'],
@@ -118,6 +119,52 @@ def generate_report(log_path, out_path, thumb_dir):
                 "reclaimed_bytes": sum(x['size'] for x in dups),
                 "reclaimed_fmt": format_size(sum(x['size'] for x in dups)),
             })
+
+    # Suspicious groups: same dimensions + EXIF but different bytes (PROBABLE_REVIEW), clustered with
+    # the item they matched. Never auto-trashed; only grouped here so they can be reviewed and marked.
+    by_id = {x['id']: x for x in items}
+    parent = {}
+    def find(a):
+        parent.setdefault(a, a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for it in items:
+        if it['action'] == 'PROBABLE_REVIEW' and it['probable']:
+            ra, rb = find(it['id']), find(it['probable'])
+            if ra != rb:
+                parent[ra] = rb
+    comps = defaultdict(list)
+    for node in list(parent):
+        comps[find(node)].append(node)
+    for nodes in comps.values():
+        gp = [by_id[n] for n in nodes if n in by_id]
+        local = next((n for n in nodes if n not in by_id and os.path.exists(n)), None)
+        if not gp:
+            continue
+        gp.sort(key=lambda x: -x['size'])  # largest file is the reference
+        keepers, dups = ([], gp) if local else (gp[:1], gp[1:] or gp)
+        group_num += 1
+        dup_groups.append({
+            "num": group_num, "kind": "suspicious",
+            "sha": keepers[0]['sha'] if keepers else gp[0]['sha'],
+            "dims": gp[0]['dims'], "camera": gp[0]['camera'], "dt": gp[0]['dt'],
+            "keepers": keepers, "local_keeper": local, "duplicates": dups,
+            "reclaimed_bytes": sum(x['size'] for x in dups),
+            "reclaimed_fmt": format_size(sum(x['size'] for x in dups)),
+        })
+    n_exact = sum(1 for g in dup_groups if g['kind'] == 'exact')
+    n_susp = len(dup_groups) - n_exact
+
+    def mark_box(it):
+        if it['action'] not in ('WOULD_TRASH', 'PROBABLE_REVIEW'):
+            return ''
+        return (f'<label class="mark-box"><input type="checkbox" class="mark-cb" data-id="{html.escape(it["id"])}" '
+                f'data-size="{it["size"]}" onchange="toggleMark(this)"> Mark for deletion</label>')
+
+    MAX_GRID = 3000
+    items_grid = items[::-1][:MAX_GRID]  # newest first, capped so the page stays usable
 
     thin_red_x_svg = '''<div class="cross-overlay">
       <svg viewBox="0 0 100 100" preserveAspectRatio="none">
@@ -430,6 +477,20 @@ def generate_report(log_path, out_path, thumb_dir):
     grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
     gap: 20px;
   }}
+  .dup-group.suspicious {{ border: 2px solid #f59e0b; }}
+  .dup-group.suspicious .group-badge-title {{ background: #f59e0b; color: #000; }}
+  .mark-box {{ display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 8px;
+    border: 1px solid #f43f5e; border-radius: 8px; color: #fda4af; font-size: 12px; font-weight: 600; cursor: pointer; }}
+  .mark-box input {{ accent-color: #f43f5e; width: 16px; height: 16px; }}
+  .card.marked {{ outline: 3px solid #f43f5e; outline-offset: 2px; }}
+  .card.marked .thumb-wrap img {{ filter: grayscale(0.7) brightness(0.55); }}
+  #markBar {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; display: flex; gap: 12px; align-items: center;
+    justify-content: center; flex-wrap: wrap; padding: 10px 16px; background: rgba(21,23,30,0.96);
+    border-top: 1px solid #2b2e3b; font-size: 13px; color: var(--text-secondary); }}
+  #markBar button {{ background: #1c1e27; color: var(--text-primary); border: 1px solid #2b2e3b; border-radius: 8px;
+    padding: 6px 12px; font-size: 13px; cursor: pointer; }}
+  #markBar button:hover {{ border-color: #f43f5e; }}
+  #markBar b {{ color: #f43f5e; font-size: 15px; }}
 </style>
 </head>
 <body>
@@ -470,6 +531,8 @@ def generate_report(log_path, out_path, thumb_dir):
   <div class="controls-bar">
     <div class="filter-tabs">
       <button class="tab-btn {grp_active}" onclick="switchView('groups', this)">Duplicate Groups <span class="tab-count">{len(dup_groups)}</span></button>
+      <button class="tab-btn" onclick="switchView('groups', this, 'exact')">Exact <span class="tab-count">{n_exact}</span></button>
+      <button class="tab-btn" onclick="switchView('groups', this, 'suspicious')">Suspicious <span class="tab-count">{n_susp}</span></button>
       <button class="tab-btn {all_active}" onclick="switchView('all', this)">All Items Grid <span class="tab-count">{total_scanned}</span></button>
       <button class="tab-btn" onclick="filterStandard('trash', this)">Deleted <span class="tab-count">{trashed_count}</span></button>
       <button class="tab-btn" onclick="filterStandard('would', this)">Would Trash <span class="tab-count">{would_trash_count}</span></button>
@@ -501,11 +564,11 @@ def generate_report(log_path, out_path, thumb_dir):
 
     for g in dup_groups:
         html_content += f"""
-    <div class="dup-group" data-search="{html.escape(f"{g['sha']} {g['camera']} {g['dt']}".lower())}">
+    <div class="dup-group {g['kind']}" data-kind="{g['kind']}" data-search="{html.escape(f"{g['sha']} {g['camera']} {g['dt']}".lower())}">
       <div class="dup-group-header">
         <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-          <span class="group-badge-title">DUPLICATE GROUP #{g['num']}</span>
-          <span class="sha-tag" title="Click to copy full SHA" onclick="navigator.clipboard.writeText('{g['sha']}')">SHA-256: {g['sha'][:16]}...</span>
+          <span class="group-badge-title">{'SUSPICIOUS' if g['kind'] == 'suspicious' else 'DUPLICATE'} GROUP #{g['num']}</span>
+          <span class="sha-tag" title="Click to copy full SHA" onclick="navigator.clipboard.writeText('{g['sha']}')">{'same size + EXIF, different file' if g['kind'] == 'suspicious' else 'SHA-256: ' + g['sha'][:16] + '...'}</span>
         </div>
         <div class="group-meta">
           <span>{html.escape(g['dims'])}</span> &bull; <span>{html.escape(g['camera'])}</span> &bull; <span>{html.escape(g['dt'])}</span>
@@ -568,7 +631,7 @@ def generate_report(log_path, out_path, thumb_dir):
         for d in g['duplicates']:
             d_pid = d['id']
             d_thumb = f"thumbnails/{d_pid}.jpg" if d['has_thumb'] else ""
-            badge_text = "DELETED (TRASH)" if d['action'] == 'TRASH' else "WOULD TRASH"
+            badge_text = {"TRASH": "DELETED (TRASH)", "PROBABLE_REVIEW": "SUSPECT (REVIEW)"}.get(d['action'], "WOULD TRASH")
             html_content += f"""
         <!-- RED CROSSED DUPLICATE CARD -->
         <div class="card card-duplicate">
@@ -584,6 +647,7 @@ def generate_report(log_path, out_path, thumb_dir):
             </div>
             <div class="camera-row">&#128247; {html.escape(d['camera'])}</div>
             <div class="date-row">{html.escape(d['dt'])}</div>
+            {mark_box(d)}
             <div class="card-footer">
               <a class="btn-link" href="https://photos.google.com/photo/{d_pid}" target="_blank">&#8599; View in Photos</a>
               <span class="sha-tag">{d['sha'][:8]}...</span>
@@ -601,12 +665,14 @@ def generate_report(log_path, out_path, thumb_dir):
   <!-- VIEW 2: FLAT ALL ITEMS GRID -->
   <div id="standardGrid" class="photo-grid" style="display: {all_disp};">"""
 
-    for item in items:
+    if len(items) > MAX_GRID:
+        html_content += f'<div style="grid-column:1/-1;color:var(--text-muted);font-size:13px;">Showing the newest {MAX_GRID} of {len(items)} scanned photos. Every duplicate and suspicious group is still listed under Duplicate Groups.</div>'
+    for item in items_grid:
         action = item['action']
-        is_dup = action in ('TRASH', 'WOULD_TRASH')
+        is_dup = action in ('TRASH', 'WOULD_TRASH', 'PROBABLE_REVIEW')
         card_cls = 'card-duplicate' if is_dup else 'card-keeper'
         badge_cls = 'badge-duplicate' if is_dup else 'badge-keeper'
-        badge_txt = '&#10006; DELETED' if action == 'TRASH' else ('&#10006; WOULD TRASH' if action == 'WOULD_TRASH' else '&#10004; ORIGINAL KEPT')
+        badge_txt = '&#10006; DELETED' if action == 'TRASH' else ('&#10006; WOULD TRASH' if action == 'WOULD_TRASH' else '&#9888; SUSPECT (REVIEW)' if action == 'PROBABLE_REVIEW' else '&#10004; ORIGINAL KEPT')
 
         pid = item['id']
         thumb_file = f"thumbnails/{pid}.jpg"
@@ -627,6 +693,7 @@ def generate_report(log_path, out_path, thumb_dir):
         </div>
         <div class="camera-row">&#128247; {html.escape(item['camera'] or 'Unknown')}</div>
         <div class="date-row">{html.escape(item['dt'] or 'No EXIF Date')}</div>
+        {mark_box(item)}
         <div class="card-footer">
           <a class="btn-link" href="https://photos.google.com/photo/{pid}" target="_blank">&#8599; View</a>
           <span class="sha-tag">{item['sha'][:8]}...</span>
@@ -636,6 +703,14 @@ def generate_report(log_path, out_path, thumb_dir):
 
     html_content += """
   </div>
+</div>
+
+<div style="height: 80px;"></div>
+<div id="markBar">
+  <span><b id="markCount">0</b> marked for deletion &middot; <span id="markSize">0 B</span> &middot; saved to marked.txt, nothing is deleted until the trash step is run</span>
+  <button onclick="markVisible(true)">Mark all duplicates in view</button>
+  <button onclick="markVisible(false)">Unmark in view</button>
+  <button onclick="clearMarks()">Clear all</button>
 </div>
 
 <script>
@@ -664,7 +739,8 @@ window.addEventListener('beforeunload', () => {
   sessionStorage.setItem('gp_view', currentView);
 });
 
-function switchView(view, btn) {
+function switchView(view, btn, kind) {
+  groupKind = kind || 'all';
   currentView = view;
   sessionStorage.setItem('gp_view', view);
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -676,6 +752,7 @@ function switchView(view, btn) {
   if (view === 'groups') {
     groupsView.style.display = 'block';
     gridView.style.display = 'none';
+    applyGroupFilter();
   } else {
     groupsView.style.display = 'none';
     gridView.style.display = 'grid';
@@ -701,10 +778,7 @@ function handleSearch() {
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
 
   if (currentView === 'groups') {
-    document.querySelectorAll('.dup-group').forEach(grp => {
-      const s = grp.getAttribute('data-search') || '';
-      grp.style.display = (!q || s.includes(q)) ? 'block' : 'none';
-    });
+    applyGroupFilter();
   } else {
     filterCards();
   }
@@ -771,6 +845,49 @@ async function checkUpdates() {
     }
   } catch (e) {}
 }
+
+let groupKind = 'all';
+let marks = new Set();
+function applyGroupFilter() {
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+  document.querySelectorAll('.dup-group').forEach(grp => {
+    const okKind = groupKind === 'all' || grp.dataset.kind === groupKind;
+    const s = grp.getAttribute('data-search') || '';
+    grp.style.display = (okKind && (!q || s.includes(q))) ? 'block' : 'none';
+  });
+}
+function fmtBytes(b) { const u = ['B','KB','MB','GB','TB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return b.toFixed(i ? 1 : 0) + ' ' + u[i]; }
+function syncMarks() {
+  const seen = new Set(); let bytes = 0;
+  document.querySelectorAll('.mark-cb').forEach(cb => {
+    const on = marks.has(cb.dataset.id);
+    cb.checked = on;
+    const card = cb.closest('.card'); if (card) card.classList.toggle('marked', on);
+    if (on && !seen.has(cb.dataset.id)) { seen.add(cb.dataset.id); bytes += parseInt(cb.dataset.size, 10) || 0; }
+  });
+  document.getElementById('markCount').textContent = marks.size;
+  document.getElementById('markSize').textContent = fmtBytes(bytes);
+}
+async function postMarks(body) {
+  try { await fetch('/api/mark', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); } catch (e) {}
+}
+function toggleMark(cb) {
+  const id = cb.dataset.id;
+  if (cb.checked) marks.add(id); else marks.delete(id);
+  syncMarks(); postMarks({ ids: [id], marked: cb.checked });
+}
+function markVisible(on) {
+  const ids = [];
+  document.querySelectorAll('.mark-cb').forEach(cb => { if (cb.offsetParent !== null) ids.push(cb.dataset.id); });
+  ids.forEach(id => on ? marks.add(id) : marks.delete(id));
+  syncMarks(); postMarks({ ids, marked: on });
+}
+function clearMarks() { marks.clear(); syncMarks(); postMarks({ clear: true }); }
+async function loadMarks() {
+  try { const r = await fetch('/api/marks?t=' + Date.now(), { cache: 'no-store' }); if (r.ok) marks = new Set((await r.json()).ids); } catch (e) {}
+  syncMarks();
+}
+window.addEventListener('DOMContentLoaded', loadMarks);
 </script>
 </body>
 </html>"""

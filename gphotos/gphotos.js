@@ -1,11 +1,24 @@
-// Google Photos duplicate audit and trash pipeline using Playwright.
+// Google Photos duplicate audit and trash pipeline (Puppeteer).
+//
 // Usage:
-//   node gphotos.js run [--limit 500] [--takeout ../takeout.sqlite] [--delete-gp-dups] [--delete-local-dups] [--keep]
+//   node gphotos.js run [--limit 500] [--takeout ../takeout.sqlite] [--delete-gp-dups] [--delete-local-dups] [--keep] [--headless]
 //   node gphotos.js report
-const { chromium } = require('playwright');
+//
+// Walks the library newest-first with the photo viewer, downloads each original, and hands it to
+// gp_ingest.py (SHA-256 + EXIF + cross-match). Dry-run by default: nothing is trashed unless
+// --delete-gp-dups / --delete-local-dups is given, and only a byte-identical match (SHA-256 + size)
+// may be trashed. Videos are skipped.
+//
+// Downloads are handled by Chrome itself (Browser.setDownloadBehavior) and picked up from a folder:
+// Playwright's download interception closes the whole browser on Google Photos' download tab.
+// Every browser step has a timeout and each photo is raced against a deadline, so a stuck page
+// produces a logged error and a screenshot instead of a silent hang.
+const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileP = promisify(execFile);
 
 const ROOT = __dirname;
 const PROFILE = path.join(ROOT, 'chrome-profile');
@@ -13,364 +26,290 @@ const DONE = path.join(ROOT, 'done.txt');
 const FAILED = path.join(ROOT, 'failed.txt');
 const TMP = path.join(ROOT, 'downloads', 'tmp');
 const KEEP = path.join(ROOT, 'downloads', 'keep');
-const THUMB_DIR = path.join(ROOT, 'thumbnails');
 const DB = path.join(ROOT, 'gphotos.sqlite');
 const LOG = path.join(ROOT, 'run-log.tsv');
+const STALL_SHOT = path.join(ROOT, 'debug_stall.png');
+
+const PHOTO_DEADLINE_MS = 120000;
+const END_AFTER_FAILED_NEXT = 5;
+const REPORT_EVERY = 200;
 
 fs.mkdirSync(TMP, { recursive: true });
-fs.mkdirSync(THUMB_DIR, { recursive: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const lines = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split(/\r?\n/).filter(Boolean) : []);
 const flagVal = (n) => { const i = process.argv.indexOf(n); return i > 0 ? process.argv[i + 1] : null; };
 const idFromUrl = (u) => (u.match(/\/photo\/([A-Za-z0-9_-]+)/) || [])[1] || null;
-const keep = process.argv.includes('--keep');
+const log = (m) => console.log(`[${new Date().toTimeString().slice(0, 8)}] ${m}`);
+const headless = process.argv.includes('--headless');
 
-function getActivePage(context) {
-  const pages = context.pages().filter((p) => !p.isClosed());
-  return (
-    pages.find((p) => p.url().includes('photos.google.com/photo/')) ||
-    pages.find((p) => p.url().includes('photos.google.com')) ||
-    pages[0] ||
-    null
-  );
+function withTimeout(promise, ms, label) {
+  let t;
+  const deadline = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`timeout after ${ms / 1000}s: ${label}`)), ms); });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(t));
 }
+
+class VideoSkip extends Error {}
 
 async function launch() {
-  // Purge any stale Chrome lockfiles before launching
-  ['lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket'].forEach((f) => {
+  for (const f of ['lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
     try { fs.rmSync(path.join(PROFILE, f), { force: true }); } catch (e) {}
-  });
-
-  return chromium.launchPersistentContext(PROFILE, {
+  }
+  const browser = await puppeteer.launch({
     channel: 'chrome',
-    headless: false,
-    viewport: null,
-    acceptDownloads: true,
-    downloadsPath: TMP,
-    args: ['--start-maximized', '--no-first-run'],
+    headless,
+    userDataDir: PROFILE,
+    defaultViewport: headless ? { width: 1400, height: 900 } : null,
+    args: headless ? ['--no-first-run'] : ['--start-maximized', '--no-first-run'],
   });
+  // If Chrome goes away, stop instead of waiting forever.
+  browser.on('disconnected', () => { log('browser closed, exiting'); process.exit(1); });
+
+  // Chrome saves downloads straight into TMP.
+  const cdp = await browser.target().createCDPSession();
+  await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: TMP });
+
+  // An unhandled JS dialog freezes every page call: dismiss them.
+  const watch = (p) => p.on('dialog', (d) => { log(`dialog ${d.type()}: ${d.message()}`); d.dismiss().catch(() => {}); });
+  (await browser.pages()).forEach(watch);
+  browser.on('targetcreated', async (t) => { if (t.type() === 'page') { const p = await t.page().catch(() => null); if (p) watch(p); } });
+  return browser;
 }
 
-async function captureThumbnail(page, outPath) {
-  if (fs.existsSync(outPath)) return true;
-  try {
-    const el = page.locator('img.BiCYpc, img[src*="photos.fife"], video').first();
-    if ((await el.count()) > 0) {
-      await el.screenshot({ path: outPath, type: 'jpeg', quality: 80, timeout: 2000 });
-      return true;
+async function activePage(browser) {
+  const pages = (await browser.pages()).filter((p) => !p.isClosed());
+  return pages.find((p) => p.url().includes('photos.google.com/photo/'))
+    || pages.find((p) => p.url().includes('photos.google.com'))
+    || pages[0] || null;
+}
+
+// Count elements matching `selector` that are actually on screen (Google Photos preloads the
+// neighbouring photos off-screen with identical classes).
+const onScreenCount = (page, selector) => page.evaluate((s) => [...document.querySelectorAll(s)].filter((e) => {
+  const r = e.getBoundingClientRect();
+  return r.width > 50 && r.height > 50 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth
+    && getComputedStyle(e).visibility !== 'hidden';
+}).length, selector);
+
+const MEDIA = 'img.BiCYpc, img[src*="photos.fife"], video';
+
+// Wait until the viewer shows the photo, and say whether it is a video.
+async function waitForViewer(page) {
+  const start = Date.now();
+  while ((await onScreenCount(page, MEDIA)) === 0) {
+    if (Date.now() - start > 10000) throw new Error('viewer did not show a photo');
+    await sleep(250);
+  }
+  const video = (await onScreenCount(page, 'video, [aria-label*="Play video" i]')) > 0;
+  return video ? 'video' : 'image';
+}
+
+// Wait for a finished, size-stable file in TMP.
+async function waitForFile(ms) {
+  const start = Date.now();
+  let last = -1, stable = 0;
+  while (Date.now() - start < ms) {
+    const names = fs.readdirSync(TMP);
+    const f = names.find((n) => !n.endsWith('.crdownload') && !n.endsWith('.tmp'));
+    if (f && !names.some((n) => n.endsWith('.crdownload'))) {
+      const size = fs.statSync(path.join(TMP, f)).size;
+      if (size > 0 && size === last && ++stable >= 2) return path.join(TMP, f);
+      if (size !== last) { last = size; stable = 0; }
     }
-  } catch (e) {}
-  try {
-    const dims = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
-    await page.screenshot({
-      path: outPath,
-      type: 'jpeg',
-      quality: 75,
-      clip: { x: 60, y: 60, width: Math.max(200, dims.width - 120), height: Math.max(200, dims.height - 120) },
+    await sleep(400);
+  }
+  return null;
+}
+
+// Shift+D downloads the original; fall back to the "More options" menu.
+async function downloadOriginal(page, id) {
+  for (const f of fs.readdirSync(TMP)) fs.rmSync(path.join(TMP, f), { force: true });
+  await sleep(1200); // let the viewer finish hydrating before sending keys
+
+  await page.keyboard.down('Shift');
+  await page.keyboard.press('KeyD');
+  await page.keyboard.up('Shift');
+  let file = await waitForFile(12000);
+
+  if (!file) {
+    await page.evaluate(() => {
+      const b = document.querySelector('button[aria-label*="More options" i], button[aria-label*="Options" i]');
+      if (b) b.click();
     });
-    return true;
-  } catch (e) {}
-  return false;
+    await sleep(500);
+    await page.evaluate(() => {
+      const m = [...document.querySelectorAll('[role="menuitem"]')].find((e) => /download/i.test(e.textContent));
+      if (m) m.click();
+    });
+    file = await waitForFile(15000);
+  }
+  if (!file) throw new Error('download did not start');
+  const target = path.join(TMP, `${id}_${path.basename(file)}`);
+  fs.renameSync(file, target);
+  return target;
+}
+
+async function ingest(id, file, takeout, keep) {
+  const args = ['gp_ingest.py', DB, id, file];
+  if (keep) args.push('--keep');
+  if (takeout) args.push('--takeout', path.resolve(takeout));
+  try {
+    const { stdout } = await execFileP('python', args, { cwd: ROOT, maxBuffer: 1 << 26, timeout: 180000 });
+    return JSON.parse(stdout.trim().split('\n').pop());
+  } catch (e) {
+    throw new Error('ingest failed: ' + String(e.stderr || e.message).trim().split('\n').pop());
+  }
 }
 
 async function trashCurrent(page) {
   try {
-    let dialog = page.locator('[role="dialog"], [role="alertdialog"]');
-    if ((await dialog.count()) === 0) {
+    const hasDialog = () => page.evaluate(() => document.querySelectorAll('[role="dialog"], [role="alertdialog"]').length);
+    if ((await hasDialog()) === 0) {
       await page.keyboard.press('#');
       await sleep(800);
     }
-
-    if ((await dialog.count()) === 0) {
-      const trashBtn = page.locator('button[aria-label*="Delete" i], button[aria-label*="Trash" i], button[aria-label*="Törlés" i]').first();
-      if ((await trashBtn.count()) > 0) {
-        await trashBtn.click().catch(() => {});
-        await sleep(800);
-      }
+    if ((await hasDialog()) === 0) {
+      await page.evaluate(() => {
+        const b = document.querySelector('button[aria-label*="Delete" i], button[aria-label*="Trash" i]');
+        if (b) b.click();
+      });
+      await sleep(800);
     }
-
-    const confirmBtn = page
-      .locator('[role="dialog"] button, [role="alertdialog"] button')
-      .filter({ hasText: /move to trash|move to bin|trash|bin|áthelyez.*kuk|kuká/i })
-      .last();
-
-    if ((await confirmBtn.count()) > 0) {
-      await confirmBtn.click();
-      await sleep(1500);
-      return true;
-    }
-  } catch (e) {}
+    const clicked = await page.evaluate(() => {
+      const btns = [...document.querySelectorAll('[role="dialog"] button, [role="alertdialog"] button')]
+        .filter((b) => /move to trash|move to bin|trash|bin/i.test(b.textContent));
+      const b = btns[btns.length - 1];
+      if (b) { b.click(); return true; }
+      return false;
+    });
+    if (clicked) { await sleep(1500); return true; }
+  } catch (e) { log('trash failed: ' + e.message); }
   return false;
 }
 
-async function advanceNext(context) {
-  const page = getActivePage(context);
-  if (!page) return false;
+// Go to the next photo; resolves true once the URL shows a different photo id.
+async function goNext(page, id) {
+  const waitChange = () => page.waitForFunction(
+    (cur) => { const m = location.href.match(/\/photo\/([A-Za-z0-9_-]+)/); return !!m && m[1] !== cur; },
+    { timeout: 5000 }, id,
+  ).then(() => true, () => false);
 
-  const beforeUrl = page.url();
-  try {
-    await page.keyboard.press('ArrowRight');
-    await sleep(250);
-  } catch (e) {}
-
-  if (page.url() !== beforeUrl) return true;
-
-  try {
-    const nextBtn = page.locator('.SxgK2b.Cwtbxf, [aria-label*="next photo" i], [aria-label*="View next photo" i], [aria-label*="Következő" i]').first();
-    if ((await nextBtn.count()) > 0) {
-      await nextBtn.click({ force: true }).catch(() => {});
-      await sleep(250);
-    }
-  } catch (e) {}
-
-  if (page.url() !== beforeUrl) return true;
-
-  try {
-    const dims = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
-    await page.mouse.click(dims.w - 40, dims.h / 2);
-    await sleep(250);
-  } catch (e) {}
-
-  return page.url() !== beforeUrl;
+  await page.keyboard.press('ArrowRight').catch(() => {});
+  if (await waitChange()) return true;
+  await page.evaluate(() => {
+    const b = document.querySelector('[aria-label*="next photo" i], [aria-label*="View next photo" i]');
+    if (b) b.click();
+  }).catch(() => {});
+  return waitChange();
 }
 
-async function triggerDownload(context) {
-  const page = getActivePage(context);
-  if (!page) return null;
-
-  for (const f of fs.readdirSync(TMP)) {
-    try { fs.rmSync(path.join(TMP, f), { force: true }); } catch (e) {}
-  }
-
-  // 1. Focus the photo viewer canvas by clicking the image element
+async function openFirstPhoto(page) {
+  await page.goto('https://photos.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
   try {
-    const img = page.locator('img.BiCYpc, img[src*="photos.fife"], video').first();
-    if ((await img.count()) > 0) {
-      await img.click({ force: true }).catch(() => {});
-      await sleep(150);
-    }
-  } catch (e) {}
-
-  // 2. Send Shift+KeyD
-  await page.keyboard.press('Shift+KeyD').catch(() => {});
-
-  // 3. Poll TMP for downloaded file (including .crdownload once stream completes)
-  const start = Date.now();
-  let lastSize = 0;
-  let stableCount = 0;
-
-  while (Date.now() - start < 15000) {
-    const files = fs.readdirSync(TMP);
-    if (files.length > 0) {
-      const fpath = path.join(TMP, files[0]);
-      try {
-        const sz = fs.statSync(fpath).size;
-        if (sz > 0) {
-          if (sz === lastSize) {
-            stableCount++;
-            if (stableCount >= 2) {
-              const cleanPath = fpath.replace(/\.crdownload$/, '');
-              if (fpath !== cleanPath) {
-                try { fs.renameSync(fpath, cleanPath); } catch (e) {}
-              }
-              return fs.existsSync(cleanPath) ? cleanPath : fpath;
-            }
-          } else {
-            lastSize = sz;
-            stableCount = 0;
-          }
-        }
-      } catch (e) {}
-    }
-
-    // If after 2.5s no file started downloading, retry Shift+KeyD or menu
-    if (Date.now() - start > 2500 && files.length === 0) {
-      try {
-        await page.keyboard.press('Shift+KeyD').catch(() => {});
-      } catch (e) {}
-    }
-
-    // If after 5s still no file, try clicking the 3-dots menu -> Download
-    if (Date.now() - start > 5000 && files.length === 0) {
-      try {
-        const moreBtn = page.locator('button[aria-label*="More options" i], button[aria-label*="További" i], button[data-tooltip*="options" i], button[aria-label*="Options" i]').first();
-        if ((await moreBtn.count()) > 0) {
-          await moreBtn.click().catch(() => {});
-          await sleep(400);
-          const dlItem = page.locator('[role="menuitem"], [role="menu"] div, div[jsaction*="click"]').filter({ hasText: /download|letöltés/i }).first();
-          if ((await dlItem.count()) > 0) {
-            await dlItem.click().catch(() => {});
-          }
-        }
-      } catch (e) {}
-    }
-
-    await sleep(300);
+    await page.waitForSelector('a[href*="/photo/"]', { timeout: 20000 });
+  } catch (e) {
+    throw new Error('No photos found in Google Photos library. Please verify login.');
   }
+  await page.evaluate(() => document.querySelector('a[href*="/photo/"]').click());
+  await page.waitForFunction(() => /\/photo\//.test(location.href), { timeout: 15000 });
+}
 
-  return null;
+function rebuildReport() {
+  return execFileP('python', ['build_html_report.py', '--log', LOG, '--out', path.join(ROOT, 'report.html')], { cwd: ROOT, timeout: 120000 })
+    .catch((e) => log('report rebuild failed: ' + e.message));
 }
 
 async function run() {
   const takeout = flagVal('--takeout');
   const delGp = process.argv.includes('--delete-gp-dups');
   const delLocal = process.argv.includes('--delete-local-dups');
+  const keep = process.argv.includes('--keep');
   const limit = Number(flagVal('--limit')) || Infinity;
   const done = new Set(lines(DONE));
 
-  console.log(`[START] Launching Playwright with saved profile (Limit: ${limit === Infinity ? 'Unlimited' : limit})`);
-  console.log(`[CONFIG] Takeout DB: ${takeout || 'None'} | Auto-Trash GP dups: ${delGp} | Auto-Trash Local dups: ${delLocal}`);
+  log(`start | limit ${limit === Infinity ? 'none' : limit} | takeout ${takeout || 'none'} | trash gp dups ${delGp} | trash local dups ${delLocal}`);
 
-  const context = await launch();
-  let page = getActivePage(context) || (await context.newPage());
+  const browser = await launch();
+  const page = (await activePage(browser)) || (await browser.newPage());
+  await openFirstPhoto(page);
 
-  await page.goto('https://photos.google.com/', { waitUntil: 'domcontentloaded' });
-  await sleep(2500);
+  let count = 0, videos = 0, failedNext = 0, fastForwarded = 0;
 
-  const photoLinks = page.locator('c-wiz a[href*="/photo/"], a.p137Zd, a[href*="/photo/"]');
-  if ((await photoLinks.count()) === 0) {
-    throw new Error('No photos found in Google Photos library. Please verify login.');
-  }
-
-  // Click first photo to enter viewer
-  await photoLinks.first().click();
-  await sleep(2000);
-
-  let count = 0;
-  let stuck = 0;
-  let lastId = null;
-
-  console.log(`\nStarting inspection loop...`);
-
-  while (count < limit && stuck < 40) {
-    page = getActivePage(context);
-    if (!page) {
-      await sleep(1000);
-      continue;
-    }
-
-    if (!page.url().includes('/photo/')) {
-      const pl = page.locator('c-wiz a[href*="/photo/"], a.p137Zd, a[href*="/photo/"]');
-      if ((await pl.count()) > 0) {
-        await pl.first().click();
-        await sleep(2000);
-      }
-      continue;
-    }
-
+  while (count < limit && failedNext < END_AFTER_FAILED_NEXT) {
     const id = idFromUrl(page.url());
-    if (!id) {
-      await sleep(1000);
-      stuck++;
-      continue;
-    }
+    if (!id) { await sleep(500); failedNext++; continue; }
 
-    if (id === lastId) {
-      stuck++;
-      if (stuck > 3) {
-        await page.evaluate(() => {
-          if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-        }).catch(() => {});
-      }
-      await advanceNext(context);
-      await sleep(400);
-      continue;
-    }
-
-    stuck = 0;
-    lastId = id;
     let trashed = false;
-
-    if (!done.has(id)) {
+    if (done.has(id)) {
+      if (++fastForwarded % 50 === 0) log(`fast-forwarded ${fastForwarded} already-done photos`);
+    } else {
       try {
-        // Allow photo viewer to hydrate and render
-        await sleep(1400);
-        page = getActivePage(context) || page;
+        trashed = await withTimeout((async () => {
+          if ((await waitForViewer(page)) === 'video') throw new VideoSkip();
+          const file = await downloadOriginal(page, id);
+          let target = file;
+          if (keep) {
+            fs.mkdirSync(KEEP, { recursive: true });
+            target = path.join(KEEP, path.basename(file));
+            fs.copyFileSync(file, target);
+          }
+          const v = await ingest(id, target, takeout, keep);
+          if (keep && fs.existsSync(file)) fs.rmSync(file, { force: true });
+          if (!v.w || !v.h) throw new VideoSkip(); // not a readable image
 
-        // 1. Capture preview thumbnail
-        await captureThumbnail(page, path.join(THUMB_DIR, `${id}.jpg`));
+          let action = 'KEEP';
+          if (v.gp_dup_of) action = delGp ? 'TRASH' : 'WOULD_TRASH';
+          else if (v.local_dup) action = delLocal ? 'TRASH' : 'WOULD_TRASH';
+          else if (v.probable) action = 'PROBABLE_REVIEW';
 
-        // 2. Download original file
-        const downloadedPath = await triggerDownload(context);
-        if (!downloadedPath || !fs.existsSync(downloadedPath)) {
-          throw new Error('Download timeout (could not fetch original file)');
-        }
+          // Only a byte-identical match (SHA-256 + size) may be trashed; anything less is log-only.
+          if (action === 'TRASH' && !(v.sha && v.size > 0)) action = 'WOULD_TRASH';
 
-        let target = downloadedPath;
-        if (keep) {
-          fs.mkdirSync(KEEP, { recursive: true });
-          target = path.join(KEEP, `${id}_${path.basename(downloadedPath)}`);
-          fs.copyFileSync(downloadedPath, target);
-        }
+          let didTrash = false;
+          if (action === 'TRASH') didTrash = await trashCurrent(page);
 
-        // 3. Ingest & measure metadata
-        const args = ['gp_ingest.py', DB, id, target];
-        if (keep) args.push('--keep');
-        if (takeout) args.push('--takeout', path.resolve(takeout));
-
-        const r = spawnSync('python', args, { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 });
-        if (r.status !== 0) throw new Error('Ingest failed: ' + r.stderr);
-
-        const v = JSON.parse(r.stdout.trim().split('\n').pop());
-        let action = 'KEEP';
-        if (v.gp_dup_of) action = delGp ? 'TRASH' : 'WOULD_TRASH';
-        else if (v.local_dup) action = delLocal ? 'TRASH' : 'WOULD_TRASH';
-        else if (v.probable) action = 'PROBABLE_REVIEW';
-
-        if (action === 'TRASH') {
-          page = getActivePage(context) || page;
-          await trashCurrent(page);
-          trashed = true;
-        }
-
-        // 4. Record to log and database
-        fs.appendFileSync(
-          LOG,
-          [id, action, v.sha, v.size, `${v.w}x${v.h}`, v.dt, v.make, v.model, v.gp_dup_of || '', v.local_dup || '', v.probable || ''].join('\t') + '\n'
-        );
+          fs.appendFileSync(LOG, [id, action, v.sha, v.size, `${v.w}x${v.h}`, v.dt, v.make, v.model,
+            v.gp_dup_of || '', v.local_dup || '', v.probable || ''].join('\t') + '\n');
+          fs.appendFileSync(DONE, id + '\n');
+          done.add(id);
+          count++;
+          log(`#${count} ${id.slice(0, 12)}… ${action} ${v.w}x${v.h}`);
+          return didTrash;
+        })(), PHOTO_DEADLINE_MS, `photo ${id}`);
+      } catch (e) {
         fs.appendFileSync(DONE, id + '\n');
         done.add(id);
-        count++;
-
-        // 5. Update HTML report live on disk
-        spawnSync('python', ['build_html_report.py', '--log', LOG, '--out', path.join(ROOT, 'report.html')], { cwd: ROOT });
-
-        process.stdout.write(`\r[${count}] Processed: ${id} | Verdict: ${action} | Dims: ${v.w}x${v.h}   \n`);
-      } catch (e) {
-        fs.appendFileSync(FAILED, `${id}\t${e.message.replace(/\s+/g, ' ')}\n`);
-        fs.appendFileSync(DONE, id + '\n'); // Mark done so it doesn't block future scans
-        done.add(id);
-        console.log(`\n[SKIP] ${id}: ${e.message}`);
+        if (e instanceof VideoSkip) {
+          videos++;
+          log(`skip ${id.slice(0, 12)}… video/non-image (${videos} skipped)`);
+        } else {
+          fs.appendFileSync(FAILED, `${id}\t${e.message.replace(/\s+/g, ' ')}\n`);
+          log(`FAILED ${id.slice(0, 12)}…: ${e.message}`);
+          await page.screenshot({ path: STALL_SHOT }).catch(() => {});
+        }
       }
-    } else {
-      process.stdout.write(`\rFast-forwarding: ${id}   `);
+      if (count > 0 && count % REPORT_EVERY === 0) await rebuildReport();
     }
 
-    if (trashed) {
-      await sleep(1000);
-      page = getActivePage(context);
-      if (page && idFromUrl(page.url()) === id) await advanceNext(context);
-    } else {
-      await advanceNext(context);
-    }
-
-    await sleep(done.has(id) ? 100 : 400);
+    if (trashed) await sleep(1000); // Google Photos moves to the next photo itself after a trash
+    const moved = trashed && idFromUrl(page.url()) !== id ? true : await goNext(page, id);
+    failedNext = moved ? 0 : failedNext + 1;
+    if (!moved) log(`could not advance from ${id.slice(0, 12)}… (${failedNext}/${END_AFTER_FAILED_NEXT})`);
   }
 
-  console.log(`\n\n[DONE] Finished run. Total processed this session: ${count}`);
-  console.log('Generating final HTML report...');
-  spawnSync('python', ['build_html_report.py', '--log', LOG, '--out', path.join(ROOT, 'report.html')], { cwd: ROOT, stdio: 'inherit' });
-  console.log(`Report ready: ${path.join(ROOT, 'report.html')}`);
-  await context.close();
+  log(`finished: ${count} processed, ${videos} videos skipped, ${fastForwarded} fast-forwarded`);
+  await rebuildReport();
+  browser.removeAllListeners('disconnected');
+  await browser.close();
 }
 
 async function report() {
-  console.log('Generating HTML visual grid report...');
-  spawnSync('python', ['build_html_report.py', '--log', LOG, '--out', path.join(ROOT, 'report.html')], { cwd: ROOT, stdio: 'inherit' });
-  console.log(`Report ready: ${path.join(ROOT, 'report.html')}`);
+  await rebuildReport();
+  log(`report ready: ${path.join(ROOT, 'report.html')}`);
 }
 
 const cmd = process.argv[2] || 'run';
-({ run, report }[cmd] || (() => { console.log('usage: node gphotos.js [run [flags] | report]'); }))()
-  .catch((e) => { console.error(e); process.exit(1); });
+(cmd === 'report' ? report() : run()).catch((e) => {
+  console.error('\n[FATAL]', e.message);
+  process.exit(1);
+});

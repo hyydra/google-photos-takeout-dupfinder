@@ -14,7 +14,7 @@ This repository contains the complete codebase and automation tools for deduplic
    * Running on **`http://localhost:8765/`**.
    * Instant dynamic reload on `run-log.tsv` changes.
    * Renders clustered duplicate groups with blue borders (`2px solid #3b82f6`), single green keeper card (`2px solid #10b981`), and red duplicate cards (`2px solid #f43f5e`) with thin SVG vector red $\times$ overlays.
-3. **Google Photos Playwright Ingestion Engine (`gphotos/gphotos.js`)**:
+3. **Google Photos Puppeteer Ingestion Engine (`gphotos/gphotos.js`)**:
    * Uses persistent Chrome context in `gphotos/chrome-profile`.
    * Intercepts `Shift+KeyD` downloads into `gphotos/downloads/tmp`.
    * Passes downloaded originals to `gp_ingest.py` for EXIF extraction, SHA-256 computation, and cross-matching against `takeout.sqlite` and `gphotos.sqlite`.
@@ -28,7 +28,7 @@ This repository contains the complete codebase and automation tools for deduplic
 | File / Folder | Purpose |
 | :--- | :--- |
 | `dupfinder.py` | Local archive scanner, multi-threaded EXIF & SHA-256 extractor, SQLite indexer, duplicate report generator. |
-| `gphotos/gphotos.js` | Main browser runner using Playwright to navigate Google Photos, download originals, and trash duplicates. |
+| `gphotos/gphotos.js` | Main browser runner using Puppeteer to navigate Google Photos, download originals, and trash duplicates. |
 | `gphotos/gp_ingest.py` | Python ingestion helper for measuring metadata, computing SHA-256, cross-referencing DBs, and saving thumbnails. |
 | `gphotos/server.py` | Zero-dependency HTTP server (`http://localhost:8765/`) serving the live dashboard and `/api/data` polling endpoint. |
 | `gphotos/build_html_report.py` | Generates standalone and live `report.html` from `run-log.tsv` with clustered duplicate group cards. |

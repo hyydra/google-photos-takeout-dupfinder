@@ -34,7 +34,7 @@ const pids = lines.map(l => l.split('\t')[0]).filter(Boolean);
       await page.goto(`https://photos.google.com/photo/${pid}`, { waitUntil: 'domcontentloaded' });
       await sleep(1500);
 
-      const img = page.locator('img.BiCYpc, img[src*="photos.fife"], img[src*="googleusercontent.com"]').first();
+      const img = page.locator('img.BiCYpc:visible, img[src*="photos.fife"]:visible, img[src*="googleusercontent.com"]:visible').first();
       await img.waitFor({ state: 'visible', timeout: 6000 }).catch(() => {});
       
       if (await img.count() > 0) {

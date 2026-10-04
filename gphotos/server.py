@@ -11,7 +11,7 @@ Serves:
 Usage:
   python server.py [--port 8765]
 """
-import argparse, http.server, io, json, os, socketserver, sys, urllib.parse
+import argparse, http.server, io, json, os, re, socketserver, sys, threading, urllib.parse
 from pathlib import Path
 from PIL import Image
 
@@ -19,6 +19,20 @@ ROOT = Path(__file__).resolve().parent
 LOG_FILE = ROOT / "run-log.tsv"
 THUMB_DIR = ROOT / "thumbnails"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+MARKS_FILE = ROOT / "marked.txt"   # photo ids the user marked for deletion in the dashboard
+MARKS_LOCK = threading.Lock()
+ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,200}$')
+
+def read_marks():
+    if not MARKS_FILE.exists():
+        return set()
+    return {l.strip() for l in MARKS_FILE.read_text(encoding='utf-8').splitlines() if l.strip()}
+
+def write_marks(marks):
+    tmp = MARKS_FILE.with_suffix('.tmp')
+    tmp.write_text("\n".join(sorted(marks)) + ("\n" if marks else ""), encoding='utf-8')
+    os.replace(tmp, MARKS_FILE)
 
 def format_size(num):
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -136,6 +150,9 @@ class LiveHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, str(e))
             return
+        elif parsed.path == '/api/marks':
+            self.send_json({"ids": sorted(read_marks())})
+            return
         elif parsed.path == '/api/data':
             try:
                 data = get_live_data()
@@ -151,9 +168,41 @@ class LiveHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def send_json(self, data, status=200):
+        payload = json.dumps(data).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        # POST /api/mark  {"ids": [...], "marked": true|false}  or  {"clear": true}
+        if urllib.parse.urlparse(self.path).path != '/api/mark':
+            self.send_error(404)
+            return
+        try:
+            n = int(self.headers.get('Content-Length', 0))
+            if n > 5_000_000:
+                self.send_error(413)
+                return
+            body = json.loads(self.rfile.read(n) or b'{}')
+            with MARKS_LOCK:
+                marks = read_marks()
+                if body.get('clear'):
+                    marks.clear()
+                else:
+                    ids = {i for i in body.get('ids', []) if isinstance(i, str) and ID_RE.match(i)}
+                    marks = (marks | ids) if body.get('marked') else (marks - ids)
+                write_marks(marks)
+            self.send_json({"ok": True, "count": len(marks)})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)}, 400)
+
     def log_message(self, format, *args):
         # Suppress routine GET logging to keep terminal clean
-        if "/api/data" in (args[0] if args else ""):
+        if "/api/data" in str(args[0] if args else ""):
             return
         super().log_message(format, *args)
 
