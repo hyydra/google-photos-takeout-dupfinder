@@ -3,7 +3,7 @@
 // Usage:
 //   node gphotos.js run [--limit 500] [--takeout ../takeout.sqlite] [--keep] [--headless]
 //   node gphotos.js trash [--headless]               # shows what it would do, trashes nothing
-//   node gphotos.js trash --confirm <count> [--headless]
+//   node gphotos.js trash --confirm <count> [--ids id1,id2,...] [--headless]
 //   node gphotos.js report
 //
 // `run` walks the library newest-first with the photo viewer, downloads each original, and hands it to
@@ -303,7 +303,9 @@ async function run() {
 // Move exactly the photos marked in the dashboard (marked.txt) to the Google Photos trash.
 // Refuses unless --confirm <count> matches the number of eligible photos.
 async function trashMarked() {
-  const marked = lines(path.join(ROOT, 'marked.txt'));
+  const allMarks = lines(path.join(ROOT, 'marked.txt'));
+  const onlyIds = flagVal('--ids'); // dashboard group button: trash exactly these ids
+  const marked = onlyIds ? onlyIds.split(',').filter(Boolean) : allMarks;
   const status = new Map(lines(LOG).map((l) => l.split('\t')).map((c) => [c[0], c[1]]));
   const eligible = marked.filter((id) => ['WOULD_TRASH', 'PROBABLE_REVIEW'].includes(status.get(id)));
   console.log(`${marked.length} marked in the dashboard, ${eligible.length} eligible `
@@ -312,6 +314,14 @@ async function trashMarked() {
   if (flagVal('--confirm') !== String(eligible.length)) {
     console.log(`\nNothing was trashed. To move these ${eligible.length} photos to the Google Photos trash `
       + `(recoverable for 60 days) run:\n  node gphotos.js trash --confirm ${eligible.length}`);
+    return;
+  }
+  // A running scan owns the Chrome profile; a second Chrome on it would clash with the scan.
+  const scanCount = await execFileP('powershell', ['-NoProfile', '-Command',
+    "(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*gphotos.js*' -and $_.CommandLine -like '* run*' } | Measure-Object).Count"])
+    .then((r) => parseInt(r.stdout, 10) || 0).catch(() => 0);
+  if (scanCount > 0) {
+    console.log('A scan is running and holds the Chrome profile. Stop it first, then run the trash step again.');
     return;
   }
   const browser = await launch();
@@ -340,7 +350,7 @@ async function trashMarked() {
     if (trashedIds.has(c[0])) c[1] = 'TRASH';
     return c.join('\t');
   }).join('\n') + '\n');
-  fs.writeFileSync(path.join(ROOT, 'marked.txt'), marked.filter((id) => !trashedIds.has(id)).join('\n') + '\n');
+  fs.writeFileSync(path.join(ROOT, 'marked.txt'), allMarks.filter((id) => !trashedIds.has(id)).join('\n') + '\n');
   log(`done: ${ok} of ${eligible.length} moved to the Google Photos trash`);
   browser.removeAllListeners('disconnected');
   await browser.close();

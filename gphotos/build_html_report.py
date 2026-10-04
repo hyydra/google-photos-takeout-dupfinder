@@ -172,6 +172,15 @@ def generate_report(log_path, out_path, thumb_dir):
         return (f'<label class="mark-box"><input type="checkbox" class="mark-cb" data-id="{html.escape(it["id"])}" '
                 f'data-size="{it["size"]}" onchange="toggleMark(this)"> Mark for deletion</label>')
 
+    def del_button(g):
+        eligible = [d for d in g['duplicates'] if d['action'] in ('WOULD_TRASH', 'PROBABLE_REVIEW')]
+        if not eligible:
+            return ''
+        ids = ','.join(html.escape(d['id']) for d in eligible)
+        warn = '1' if g['kind'] == 'suspicious' else '0'
+        return (f'<button class="del-btn" data-ids="{ids}" data-n="{len(eligible)}" data-warn="{warn}" '
+                f'onclick="deleteOnlineGroup(this)">Delete {len(eligible)} duplicate{"s" if len(eligible) != 1 else ""}</button>')
+
     MAX_GRID = 3000
     items_grid = items[::-1][:MAX_GRID]  # newest first, capped so the page stays usable
 
@@ -500,6 +509,16 @@ def generate_report(log_path, out_path, thumb_dir):
     padding: 6px 12px; font-size: 13px; cursor: pointer; }}
   #markBar button:hover {{ border-color: #f43f5e; }}
   #markBar b {{ color: #f43f5e; font-size: 15px; }}
+  .dup-group, #standardGrid .card {{ content-visibility: auto; contain-intrinsic-size: auto 520px; }}
+  .del-btn {{ background: #3a1219; color: #fda4af; border: 1px solid #f43f5e; border-radius: 8px; padding: 5px 12px;
+    font-size: 12px; font-weight: 700; cursor: pointer; margin-left: 10px; }}
+  .del-btn:hover {{ background: #f43f5e; color: #fff; }}
+  .del-btn:disabled {{ opacity: 0.5; cursor: default; }}
+  #toast {{ position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%); background: #15171e; border: 1px solid #10b981;
+    color: #f3f4f6; padding: 10px 16px; border-radius: 10px; font-size: 13px; max-width: 90vw; z-index: 60;
+    opacity: 0; pointer-events: none; transition: opacity 0.2s; }}
+  #toast.show {{ opacity: 1; }}
+  #toast.bad {{ border-color: #f59e0b; }}
 </style>
 </head>
 <body>
@@ -583,6 +602,7 @@ def generate_report(log_path, out_path, thumb_dir):
         <div class="group-meta">
           <span>{html.escape(g['dims'])}</span> &bull; <span>{html.escape(g['camera'])}</span> &bull; <span>{html.escape(g['dt'])}</span>
           <span class="reclaim-pill">+{g['reclaimed_fmt']} Reclaimed</span>
+          {del_button(g)}
         </div>
       </div>
       <div class="group-cards-row">"""
@@ -595,7 +615,7 @@ def generate_report(log_path, out_path, thumb_dir):
         <!-- GREEN KEEPER CARD -->
         <div class="card card-keeper">
           <div class="thumb-wrap">
-            {f'<img src="{k_thumb}" alt="Keeper">' if k_thumb else '<div class="thumb-placeholder"><span>&#128247;</span><span>No Preview</span></div>'}
+            {f'<img src="{k_thumb}" alt="Keeper" loading="lazy" decoding="async">' if k_thumb else '<div class="thumb-placeholder"><span>&#128247;</span><span>No Preview</span></div>'}
             <span class="badge badge-keeper">&#10004; ORIGINAL KEEPER</span>
           </div>
           <div class="card-body">
@@ -620,7 +640,7 @@ def generate_report(log_path, out_path, thumb_dir):
         <!-- GREEN LOCAL KEEPER CARD -->
         <div class="card card-keeper">
           <div class="thumb-wrap">
-            {f'<img src="{loc_thumb}" alt="Local Keeper">' if loc_thumb else '<div class="thumb-placeholder"><span>&#128190;</span><span>Local File</span></div>'}
+            {f'<img src="{loc_thumb}" alt="Local Keeper" loading="lazy" decoding="async">' if loc_thumb else '<div class="thumb-placeholder"><span>&#128190;</span><span>Local File</span></div>'}
             <span class="badge badge-keeper">&#10004; LOCAL KEEPER (TAKEOUT)</span>
           </div>
           <div class="card-body">
@@ -646,7 +666,7 @@ def generate_report(log_path, out_path, thumb_dir):
         <!-- RED CROSSED DUPLICATE CARD -->
         <div class="card card-duplicate">
           <div class="thumb-wrap">
-            {f'<img src="{d_thumb}" alt="Duplicate">' if d_thumb else '<div class="thumb-placeholder"><span>&#128247;</span><span>No Preview</span></div>'}
+            {f'<img src="{d_thumb}" alt="Duplicate" loading="lazy" decoding="async">' if d_thumb else '<div class="thumb-placeholder"><span>&#128247;</span><span>No Preview</span></div>'}
             {thin_red_x_svg}
             <span class="badge badge-duplicate">&#10006; {badge_text}</span>
           </div>
@@ -697,7 +717,7 @@ def generate_report(log_path, out_path, thumb_dir):
 
         pid = item['id']
         thumb_file = f"thumbnails/{pid}.jpg"
-        img_html = f'<img src="{thumb_file}" alt="{html.escape(pid)}" loading="lazy">' if item['has_thumb'] else f'<div class="thumb-placeholder"><span>&#128247;</span><span>{html.escape(item["dims"] or "No Preview")}</span></div>'
+        img_html = f'<img src="{thumb_file}" alt="{html.escape(pid)}" loading="lazy" decoding="async">' if item['has_thumb'] else f'<div class="thumb-placeholder"><span>&#128247;</span><span>{html.escape(item["dims"] or "No Preview")}</span></div>'
         cross_html = thin_red_x_svg if is_dup else ""
 
         html_content += f"""
@@ -975,16 +995,80 @@ async function loadLocal(reset) {
         '<div class="dup-group ' + (localKind === 'exact' ? 'exact' : 'suspicious') + '">'
         + '<div class="dup-group-header"><div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;"><span class="group-badge-title">LOCAL GROUP #' + num + '</span>'
         + '<span class="sha-tag">' + (localKind === 'exact' ? 'SHA-256: ' : 'pixels: ') + esc(String(g.key).slice(0, 16)) + '...</span></div>'
-        + '<div class="group-meta"><span>' + g.count + ' files</span> &bull; <span class="reclaim-pill">' + fmtBytes(g.bytes || 0) + ' total</span></div></div>'
+        + '<div class="group-meta"><span>' + g.count + ' files</span> &bull; <span class="reclaim-pill">' + fmtBytes(g.bytes || 0) + ' total</span>'
+        + (localKind === 'exact' ? ' <button class="del-btn" data-key="' + esc(g.key) + '" data-n="' + (g.count - 1) + '" onclick="deleteLocalGroup(this)">Delete ' + (g.count - 1) + ' duplicates</button>' : '')
+        + '</div></div>'
         + '<div class="group-cards-row">' + files.map((f, j) => localCard(f, j === 0)).join('') + '</div></div>');
     });
     localOffset += (d.groups || []).length;
     more.style.display = localOffset < localTotal ? 'inline-block' : 'none';
+    setTimeout(() => {
+      const r = more.getBoundingClientRect();
+      if (more.style.display !== 'none' && currentView === 'local' && r.top < window.innerHeight + 600) loadLocal(false);
+    }, 400);
   } catch (e) {
     stats.textContent = 'Could not load local Takeout data: ' + e;
   }
   localBusy = false;
 }
+const NL = String.fromCharCode(10);
+function toast(msg, bad) {
+  let t = document.getElementById('toast');
+  if (!t) { t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }
+  t.textContent = msg;
+  t.className = bad ? 'bad show' : 'show';
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), 9000);
+}
+async function postDelete(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'dupfinder' }, body: JSON.stringify(body) });
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+async function deleteLocalGroup(btn) {
+  const n = btn.dataset.n;
+  const msg = 'Move ' + n + ' duplicate file' + (n === '1' ? '' : 's') + ' of this group to the takeout-dupes folder on the same drive?' + NL + NL
+    + 'The oldest copy is kept. Each file is re-checked by SHA-256 first, nothing is permanently deleted, and every move is logged in quarantine-log.tsv.';
+  if (!window.confirm(msg)) return;
+  btn.disabled = true;
+  btn.textContent = 'Moving...';
+  try {
+    const d = await postDelete('/api/delete-local', { sha: btn.dataset.key });
+    toast('Moved ' + d.moved.length + ' file(s) to takeout-dupes' + (d.skipped.length ? ', skipped ' + d.skipped.length + ' (changed or missing)' : '') + '.', d.skipped.length > 0);
+    if (d.skipped.length === 0 && d.moved.length > 0) {
+      const grp = btn.closest('.dup-group');
+      if (grp) grp.remove();
+      localTotal = Math.max(0, localTotal - 1);
+      document.getElementById('localCount').textContent = localTotal;
+    } else {
+      loadLocal(true); // something was skipped: show the group as it really is now
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Delete ' + n + ' duplicates';
+    toast('Not deleted: ' + e.message, true);
+  }
+}
+async function deleteOnlineGroup(btn) {
+  const ids = btn.dataset.ids.split(',').filter(Boolean);
+  let msg = 'Move ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') + ' of this group to the Google Photos trash (recoverable for 60 days)?';
+  if (btn.dataset.warn === '1') msg += NL + NL + 'WARNING: these are suspects, not byte-identical copies. Check them against the reference photo first.';
+  if (!window.confirm(msg)) return;
+  btn.disabled = true;
+  try {
+    const d = await postDelete('/api/delete-online', { ids });
+    btn.textContent = d.started ? 'Trashing...' : 'Queued';
+    toast(d.message, !d.started);
+    loadMarks();
+  } catch (e) {
+    btn.disabled = false;
+    toast('Not deleted: ' + e.message, true);
+  }
+}
+const localObserver = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting) && currentView === 'local') loadLocal(false); }, { rootMargin: '600px' });
+window.addEventListener('DOMContentLoaded', () => { const m = document.getElementById('localMore'); if (m) localObserver.observe(m); });
 window.addEventListener('DOMContentLoaded', () => { fetch('/api/local?kind=exact&offset=0&limit=1').then(r => r.json()).then(d => { document.getElementById('localCount').textContent = d.total || 0; }).catch(() => {}); });
 </script>
 </body>

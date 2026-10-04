@@ -11,7 +11,7 @@ Serves:
 Usage:
   python server.py [--port 8765]
 """
-import argparse, hashlib, http.server, io, json, os, re, socketserver, sqlite3, sys, threading, time, urllib.parse
+import argparse, hashlib, http.server, io, json, os, re, shutil, socketserver, sqlite3, subprocess, sys, threading, time, urllib.parse
 from pathlib import Path
 from PIL import Image, ImageOps
 try:
@@ -71,6 +71,95 @@ def local_thumb(path):
         except Exception:
             return None
     return out
+
+DB_LOCK = threading.Lock()
+QUARANTINE_LOG = ROOT / "quarantine-log.tsv"
+SHA_RE = re.compile(r'^[0-9a-f]{64}$')
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+def delete_local_group(sha):
+    """'Delete' the duplicates of one byte-identical local group: keep the oldest copy and MOVE the others
+    into <drive>:/takeout-dupes (same drive, reversible, logged). Every file is re-verified by SHA-256
+    right before it is moved; anything that no longer matches the index is left alone."""
+    if not SHA_RE.match(sha or ""):
+        raise ValueError("bad checksum")
+    with DB_LOCK:
+        ro = takeout_conn()
+        if not ro:
+            raise ValueError("takeout index not found")
+        rows = ro.execute("SELECT path FROM f WHERE sha=? ORDER BY mtime, LENGTH(path)", (sha,)).fetchall()
+        paths = [r[0] for r in rows]
+        if len(paths) < 2:
+            raise ValueError("this is no longer a duplicate group")
+        keeper = paths[0]
+        if not os.path.exists(keeper) or file_sha256(keeper) != sha:
+            raise ValueError("the copy to keep is missing or changed on disk; nothing was moved")
+        moved, skipped = [], []
+        for src in paths[1:]:
+            try:
+                if not os.path.exists(src):
+                    skipped.append([src, "missing"])
+                    continue
+                if file_sha256(src) != sha:
+                    skipped.append([src, "content no longer matches the index"])
+                    continue
+                qdir = Path(os.environ.get("QUARANTINE_DIR") or (os.path.splitdrive(src)[0] + os.sep + "takeout-dupes"))
+                qdir.mkdir(parents=True, exist_ok=True)
+                dst = qdir / f"{sha[:8]}_{Path(src).name}"
+                n = 1
+                while dst.exists():
+                    dst = qdir / f"{sha[:8]}_{n}_{Path(src).name}"
+                    n += 1
+                shutil.move(src, str(dst))
+                with open(QUARANTINE_LOG, "a", encoding="utf-8") as lf:
+                    lf.write(f"{time.strftime('%F %T')}\t{sha}\t{src}\t{dst}\t{keeper}\n")
+                moved.append([src, str(dst)])
+            except Exception as e:
+                skipped.append([src, str(e)])
+        if moved:
+            rw = sqlite3.connect(str(TAKEOUT_DB), timeout=60)
+            rw.executemany("DELETE FROM f WHERE path=?", [(m[0],) for m in moved])
+            rw.commit()
+            rw.close()
+            _local_cache.clear()
+    return {"ok": True, "kept": keeper, "moved": moved, "skipped": skipped}
+
+def scan_running():
+    """True while a `gphotos.js run` scan is alive (it owns the Chrome profile)."""
+    cmd = ("(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object "
+           "{ $_.CommandLine -like '*gphotos.js*' -and $_.CommandLine -like '* run*' } | Measure-Object).Count")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=30).stdout
+    return (out.strip() or "0") != "0"
+
+def delete_online(ids):
+    """Queue photos for the Google Photos trash (marked.txt). If no scan is running, start the confirm-gated
+    trash step for exactly these ids right away; otherwise they wait for the next `gphotos.js trash`."""
+    ids = [i for i in ids if isinstance(i, str) and ID_RE.match(i)]
+    status = {}
+    if LOG_FILE.exists():
+        for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
+            c = line.split("\t")
+            if len(c) > 1:
+                status[c[0]] = c[1]
+    eligible = [i for i in ids if status.get(i) in ("WOULD_TRASH", "PROBABLE_REVIEW")]
+    if not eligible:
+        raise ValueError("none of these photos is a logged duplicate or suspect")
+    with MARKS_LOCK:
+        write_marks(read_marks() | set(eligible))
+    if scan_running():
+        return {"ok": True, "queued": len(eligible), "started": False,
+                "message": "A scan is running and holds the Chrome profile, so these photos were queued. "
+                           "Stop the scan, then run: node gphotos.js trash --confirm <count>"}
+    cmd = ["node", "gphotos.js", "trash", "--ids", ",".join(eligible), "--confirm", str(len(eligible)), "--headless"]
+    subprocess.Popen(cmd, cwd=str(ROOT), stdout=open(ROOT / "trash-run.log", "a"), stderr=subprocess.STDOUT)
+    return {"ok": True, "queued": len(eligible), "started": True,
+            "message": f"Moving {len(eligible)} photo(s) to the Google Photos trash in the background (see trash-run.log)."}
 
 MARKS_FILE = ROOT / "marked.txt"   # photo ids the user marked for deletion in the dashboard
 MARKS_LOCK = threading.Lock()
@@ -252,9 +341,34 @@ class LiveHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def same_origin(self):
+        """Only the dashboard page itself may POST: blocks other websites from driving localhost."""
+        origin = self.headers.get('Origin')
+        if origin and urllib.parse.urlparse(origin).netloc != self.headers.get('Host', ''):
+            return False
+        return self.headers.get('X-Requested-With') == 'dupfinder'
+
     def do_POST(self):
         # POST /api/mark  {"ids": [...], "marked": true|false}  or  {"clear": true}
-        if urllib.parse.urlparse(self.path).path != '/api/mark':
+        # POST /api/delete-local {"sha": ...}   POST /api/delete-online {"ids": [...]}
+        path = urllib.parse.urlparse(self.path).path
+        if path in ('/api/delete-local', '/api/delete-online'):
+            if not self.same_origin():
+                self.send_json({"ok": False, "error": "forbidden"}, 403)
+                return
+            try:
+                n = int(self.headers.get('Content-Length', 0))
+                body = json.loads(self.rfile.read(min(n, 1_000_000)) or b'{}')
+                if path == '/api/delete-local':
+                    self.send_json(delete_local_group(body.get('sha', '')))
+                else:
+                    self.send_json(delete_online(body.get('ids', [])))
+            except ValueError as e:
+                self.send_json({"ok": False, "error": str(e)}, 400)
+            except Exception as e:
+                self.send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+            return
+        if path != '/api/mark':
             self.send_error(404)
             return
         try:
