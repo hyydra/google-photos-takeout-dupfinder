@@ -52,6 +52,8 @@ def local_groups(kind, offset, limit):
         cached = _local_cache[kind] = (time.time(), rows, files_total, hashed, reclaim)
     _, rows, files_total, hashed, reclaim = cached
     cols = ("path", "size", "w", "h", "dt", "make", "model", "mtime")
+    if "crc" in {r[1] for r in db.execute("PRAGMA table_info(f)")}:
+        cols += ("crc",)          # shown next to the SHA-256 once the hash pass has computed it
     groups = []
     for k, n, total in rows[offset:offset + limit]:
         files = db.execute(f"SELECT {','.join(cols)} FROM f WHERE {key}=? ORDER BY mtime, LENGTH(path)", (k,)).fetchall()

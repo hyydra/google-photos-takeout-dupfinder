@@ -580,6 +580,7 @@ def generate_report(log_path, out_path, thumb_dir):
         <span style="font-weight:700;">LIVE</span>
         <span id="refreshCountdown" style="color:var(--text-muted); font-size:12px;">3s</span>
       </div>
+      <span id="localLive" style="font-size: 13px; color: var(--text-secondary);" title="Local Takeout clean-up, refreshed every 10 seconds"></span>
       <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer;">
         <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()"> Auto-refresh
       </label>
@@ -990,7 +991,7 @@ function localCard(f, keeper) {
     + '<span class="badge ' + (keeper ? 'badge-keeper' : 'badge-duplicate') + '">' + (keeper ? '&#10004; KEEP (OLDEST)' : '&#10006; DUPLICATE') + '</span></div>'
     + '<div class="card-body"><div class="meta-row"><span class="meta-pill">' + dims + '</span><span class="meta-pill">' + fmtBytes(f.size || 0) + '</span></div>'
     + '<div class="camera-row" title="' + esc(f.path) + '">&#128190; ' + esc(name) + '</div>'
-    + '<div class="date-row">' + esc(f.dt || 'No EXIF Date') + '</div>'
+    + '<div class="date-row">' + esc(f.dt || 'No EXIF Date') + (f.crc ? ' &middot; crc32 ' + esc(f.crc) : '') + '</div>'
     + '<div class="date-row" title="' + esc(f.path) + '" style="font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(f.path) + '</div></div></div>';
 }
 async function loadLocal(reset) {
@@ -1039,6 +1040,20 @@ async function loadLocal(reset) {
   }
   localBusy = false;
 }
+async function refreshLocalLive() {
+  try {
+    const [a, b] = await Promise.all([
+      fetch('/api/recycled?limit=1', { cache: 'no-store' }).then(r => r.json()),
+      fetch('/api/local?kind=exact&offset=0&limit=1', { cache: 'no-store' }).then(r => r.json()),
+    ]);
+    const el = document.getElementById('localLive');
+    if (el) el.textContent = 'Local: ' + (a.files || 0).toLocaleString() + ' duplicates in the Recycle Bin (' + fmtBytes(a.bytes || 0) + ') · ' + (b.total || 0).toLocaleString() + ' exact groups left · ' + (b.files_total || 0).toLocaleString() + ' files indexed';
+    const c = document.getElementById('localCount');
+    if (c && !localBusy) c.textContent = b.total || 0;
+  } catch (e) {}
+}
+setInterval(refreshLocalLive, 10000);
+window.addEventListener('DOMContentLoaded', refreshLocalLive);
 const NL = String.fromCharCode(10);
 function toast(msg, bad) {
   let t = document.getElementById('toast');

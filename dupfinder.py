@@ -17,7 +17,7 @@ Usage:
   python dupfinder.py scan D:\\Photos E:\\Backup --out report
   python dupfinder.py scan D:\\Photos --out report --quarantine D:\\dupes --keep oldest
 """
-import argparse, csv, hashlib, json, os, shutil, sqlite3, sys, time
+import argparse, csv, hashlib, json, os, shutil, sqlite3, sys, time, zlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -36,13 +36,13 @@ except Exception:
 TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 DB_SCHEMA = """CREATE TABLE IF NOT EXISTS f(
  path TEXT PRIMARY KEY, size INT, mtime REAL, sha TEXT, w INT, h INT,
- dt TEXT, make TEXT, model TEXT, uid TEXT, pix TEXT, dh TEXT)"""
+ dt TEXT, make TEXT, model TEXT, uid TEXT, pix TEXT, dh TEXT, crc TEXT)"""
 
 
 def migrate(db):
     """Add the content-hash columns and lookup indexes to a database made by an older version."""
     cols = {r[1] for r in db.execute("PRAGMA table_info(f)")}
-    for c in ("pix", "dh"):
+    for c in ("pix", "dh", "crc"):
         if c not in cols:
             db.execute(f"ALTER TABLE f ADD COLUMN {c} TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_f_sha ON f(sha)")
@@ -80,6 +80,17 @@ def sha256(path, bufsize=1 << 20):
     return h.hexdigest()
 
 
+def sha256_crc32(path, bufsize=1 << 20):
+    """SHA-256 and CRC32 of the file bytes from one read of the file."""
+    h = hashlib.sha256()
+    crc = 0
+    with open(path, "rb") as fh:
+        while chunk := fh.read(bufsize):
+            h.update(chunk)
+            crc = zlib.crc32(chunk, crc)
+    return h.hexdigest(), f"{crc & 0xFFFFFFFF:08x}"
+
+
 def read_meta(path):
     w = h = None
     dt = make = model = uid = ""
@@ -103,8 +114,9 @@ def read_meta(path):
 def process(path):
     st = os.stat(path)
     w, h, dt, make, model, uid = read_meta(path)
-    return (str(path), st.st_size, st.st_mtime, sha256(path), w, h, dt, make, model, uid,
-            *content_hashes(path))
+    sha, crc = sha256_crc32(path)
+    return (str(path), st.st_size, st.st_mtime, sha, w, h, dt, make, model, uid,
+            *content_hashes(path), crc)
 
 
 def walk(roots):
@@ -124,7 +136,7 @@ def scan(args):
     for p in walk(args.paths):
         st = os.stat(p)
         c = cached.get(str(p))
-        if c and c[1] == st.st_size and c[2] == st.st_mtime and c[10] is not None:  # NULL pix = not content-hashed yet
+        if c and c[1] == st.st_size and c[2] == st.st_mtime and c[10] is not None and c[12] is not None:  # NULL pix/crc = not fully hashed yet
             rows.append(c)
         else:
             todo.append(p)
@@ -133,7 +145,7 @@ def scan(args):
     with ThreadPoolExecutor(args.workers) as ex:
         for i, r in enumerate(ex.map(lambda p: safe(process, p), todo), 1):
             if r:
-                db.execute("INSERT OR REPLACE INTO f VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", r)
+                db.execute("INSERT OR REPLACE INTO f VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
                 rows.append(r)
             if i % 200 == 0:
                 db.commit()
@@ -152,7 +164,7 @@ def safe(fn, p):
 def group(rows):
     exact = defaultdict(list)
     for r in rows:
-        exact[r[3]].append(r)
+        exact[(r[3], r[12])].append(r)      # byte-identical = same SHA-256 AND same CRC32
     exact = [g for g in exact.values() if len(g) > 1]
     in_exact = {r[0] for g in exact for r in g}
 
@@ -185,7 +197,7 @@ def write_reports(exact, probable, pixel, out):
     with open(out + ".csv", "w", newline="", encoding="utf-8") as fh:
         wr = csv.writer(fh)
         wr.writerow(["type", "group", "path", "size", "mtime", "sha256", "w", "h",
-                     "exif_datetime", "make", "model", "unique_id", "pixel_sha256", "dhash"])
+                     "exif_datetime", "make", "model", "unique_id", "pixel_sha256", "dhash", "crc32"])
         for kind, groups in (("EXACT", exact), ("PIXEL", pixel), ("PROBABLE", probable)):
             for i, g in enumerate(groups, 1):
                 for r in g:
