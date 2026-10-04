@@ -21,6 +21,8 @@ except Exception:
     pass
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:      # localtrash / build_html_report live next to this file, however it is launched
+    sys.path.insert(0, str(ROOT))
 LOG_FILE = ROOT / "run-log.tsv"
 THUMB_DIR = ROOT / "thumbnails"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
