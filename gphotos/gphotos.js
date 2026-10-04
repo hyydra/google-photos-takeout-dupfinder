@@ -62,6 +62,7 @@ async function launch() {
     channel: 'chrome',
     headless,
     userDataDir: PROFILE,
+    dumpio: !!process.env.DUMPIO,      // DUMPIO=1 prints Chrome's own stderr (for debugging a vanishing browser)
     defaultViewport: headless ? { width: 1400, height: 900 } : null,
     args: headless ? ['--no-first-run'] : ['--start-maximized', '--no-first-run'],
   });
@@ -116,10 +117,11 @@ async function waitForFile(ms) {
     const f = names.find((n) => !n.endsWith('.crdownload') && !n.endsWith('.tmp'));
     if (f && !names.some((n) => n.endsWith('.crdownload'))) {
       const size = fs.statSync(path.join(TMP, f)).size;
-      if (size > 0 && size === last && ++stable >= 2) return path.join(TMP, f);
+      // Chrome renames <name>.crdownload to <name> only when the download is complete: one stable read is enough.
+      if (size > 0 && size === last && ++stable >= 1) return path.join(TMP, f);
       if (size !== last) { last = size; stable = 0; }
     }
-    await sleep(400);
+    await sleep(100);
   }
   return null;
 }
@@ -127,7 +129,7 @@ async function waitForFile(ms) {
 // Shift+D downloads the original; fall back to the "More options" menu.
 async function downloadOriginal(page, id) {
   for (const f of fs.readdirSync(TMP)) fs.rmSync(path.join(TMP, f), { force: true });
-  await sleep(1200); // let the viewer finish hydrating before sending keys
+  await sleep(250); // brief settle before sending keys (was 1200 ms: most of the per-photo time)
 
   await page.keyboard.down('Shift');
   await page.keyboard.press('KeyD');
@@ -256,6 +258,21 @@ async function run() {
   const page = (await activePage(browser)) || (await browser.newPage());
   await openFirstPhoto(page);
 
+  // Resume: jump straight to the last photo that was finished instead of replaying the whole library with the
+  // arrow key (that took minutes at 2,000 photos and would take hours at 100,000). --from-start replays it.
+  const resumeId = lines(DONE).pop();
+  if (resumeId && !process.argv.includes('--from-start') && sweep.size === 0) {
+    try {
+      await page.goto(`https://photos.google.com/photo/${resumeId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await waitForViewer(page).catch(() => {});
+      if (idFromUrl(page.url()) === resumeId) log(`resumed at the last finished photo ${resumeId.slice(0, 12)}… (${done.size} already done, not replayed)`);
+      else { log('resume jump landed elsewhere, going back to the start'); await openFirstPhoto(page); }
+    } catch (e) {
+      log(`resume jump failed (${e.message}), replaying from the start`);
+      await openFirstPhoto(page);
+    }
+  }
+
   let count = 0, videos = 0, failedNext = 0, fastForwarded = 0, swept = 0;
 
   while (count < limit && failedNext < END_AFTER_FAILED_NEXT) {
@@ -282,8 +299,11 @@ async function run() {
     } else {
       try {
         trashed = await withTimeout((async () => {
+          const T0 = Date.now();
           if ((await waitForViewer(page)) === 'video') throw new VideoSkip();
+          const T1 = Date.now();
           const file = await downloadOriginal(page, id);
+          const T2 = Date.now();
           let target = file;
           if (keep) {
             fs.mkdirSync(KEEP, { recursive: true });
@@ -291,6 +311,7 @@ async function run() {
             fs.copyFileSync(file, target);
           }
           const v = await ingest(id, target, takeout, keep);
+          const T3 = Date.now();
           if (keep && fs.existsSync(file)) fs.rmSync(file, { force: true });
           if (!v.w || !v.h) throw new VideoSkip(); // not a readable image
 
@@ -314,7 +335,7 @@ async function run() {
           fs.appendFileSync(DONE, id + '\n');
           done.add(id);
           count++;
-          log(`#${count} ${id.slice(0, 12)}… ${action}${v.reason ? ' (' + v.reason + ')' : ''} ${v.w}x${v.h}`);
+          log(`#${count} ${id.slice(0, 12)}… ${action}${v.reason ? ' (' + v.reason + ')' : ''} ${v.w}x${v.h}  [view ${T1 - T0}ms, download ${T2 - T1}ms, ingest ${T3 - T2}ms]`);
           return didTrash;
         })(), PHOTO_DEADLINE_MS, `photo ${id}`);
       } catch (e) {
